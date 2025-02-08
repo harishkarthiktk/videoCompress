@@ -1,20 +1,21 @@
 import os, sys, subprocess, platform
-import concurrent.futures
-from tqdm import tqdm
 
-# supported video formats
-SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V")
+# Supported video formats
+SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", "mpg", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V", "MPG")
 
-# target resolution & bitrate
-TARGET_RESOLUTION = (1920, 1080)
-TARGET_BITRATE = 5000  # in kbps
+# Target bitrate limits
+MAX_BITRATE = 10000  # Max total bitrate in kbps (10 Mbps)
+COMPRESSION_FACTOR = 0.8  # Reduce bitrate by 20%
+MAX_DOWNSCALE_PERCENT = 0.2  # 20% max resolution reduction
 
 '''
-The script converts {{SUPPORTED FORMATS}} to .mp4 format with optimal compression.
-It uses GPU acceleration if available and skips a file if _conv.mp4 already exists.
+This script converts videos to .mp4 format with optimal compression.
+- Uses GPU acceleration if available.
+- Skips processing if _conv.mp4 already exists.
+- Ensures at least 20% compression if bitrate ≤ 10 Mbps.
 '''
 
-# detect gpu type (nvidia > intel > amd > apple > cpu)
+# Detect GPU type (NVIDIA > Intel > AMD > Apple > CPU)
 def detect_gpu():
     system = platform.system()
     gpu_type = "CPU"
@@ -24,10 +25,10 @@ def detect_gpu():
             output = subprocess.check_output("wmic path win32_VideoController get Name", shell=True, text=True)
         elif system == "Linux":
             output = subprocess.check_output("lspci | grep -i vga", shell=True, text=True)
-        elif system == "Darwin":  # macos
+        elif system == "Darwin":  # macOS
             output = subprocess.check_output("system_profiler SPDisplaysDataType", shell=True, text=True)
         else:
-            return gpu_type  # default to cpu if os is unknown
+            return gpu_type  # Default to CPU if OS is unknown
 
         output = output.lower()
 
@@ -44,7 +45,7 @@ def detect_gpu():
 
     return gpu_type
 
-# get video resolution & bitrate
+# Get video resolution & bitrate
 def get_video_info(file):
     try:
         cmd = [
@@ -60,7 +61,7 @@ def get_video_info(file):
             if "height=" in line:
                 height = int(line.split("=")[1])
             if "bit_rate=" in line:
-                bitrate = int(line.split("=")[1]) // 1000  # convert bps to kbps
+                bitrate = int(line.split("=")[1]) // 1000  # Convert bps to kbps
 
         return width, height, bitrate
 
@@ -68,59 +69,56 @@ def get_video_info(file):
         print(f"Failed to get video info for {file}: {e}")
         return None, None, None
 
-# convert video with detected gpu acceleration
-def convert_video(file, gpu_type, progress_bar):
+# Convert video with detected GPU acceleration
+def convert_video(file, gpu_type):
     filename, ext = os.path.splitext(file)
     output_file = f"{filename}_conv.mp4"
 
-    # skip if already converted
+    # Skip if already converted
     if os.path.exists(output_file):
-        progress_bar.update(1)
         print(f"Skipping {file}, already converted.")
         return
 
-    # get input resolution & bitrate
+    # Get input resolution & bitrate
     width, height, bitrate = get_video_info(file)
 
-    # skip if input resolution & bitrate are already lower than target
-    if width is not None and height is not None and bitrate is not None:
-        if (width, height) <= TARGET_RESOLUTION and bitrate <= TARGET_BITRATE:
-            progress_bar.update(1)
-            print(f"Skipping {file}, already optimal (Resolution: {width}x{height}, Bitrate: {bitrate} kbps).")
-            return
+    # Determine new bitrate
+    if bitrate:
+        if bitrate > MAX_BITRATE:
+            target_bitrate = MAX_BITRATE  # Limit to 10 Mbps
+        else:
+            target_bitrate = int(bitrate * COMPRESSION_FACTOR)  # Reduce by 20%
+
+    # Calculate the new resolution (maximum 20% downscale)
+    new_width = int(width * (1 - MAX_DOWNSCALE_PERCENT))
+    new_height = int(height * (1 - MAX_DOWNSCALE_PERCENT))
 
     print(f"Processing: {file} -> {output_file} using {gpu_type}")
 
-    # maintain aspect ratio while scaling
+    # Downscale while maintaining aspect ratio and limit bitrate
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", file, "-vf",
-        "scale='if(gt(iw,1920),1920,if(lt(iw,1280),1280,iw))':'if(gt(ih,1080),1080,if(lt(ih,720),720,ih))':force_original_aspect_ratio=decrease"
+        f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease"
     ]
 
+    # Select GPU encoder if available
     if gpu_type == "NVIDIA":
-        ffmpeg_cmd += ["-c:v", "h264_nvenc", "-preset", "slow", "-cq", "23"]
+        ffmpeg_cmd += ["-c:v", "h264_nvenc", "-preset", "slow", "-b:v", f"{target_bitrate}k"]
     elif gpu_type == "INTEL":
-        ffmpeg_cmd += ["-c:v", "h264_qsv", "-preset", "slow", "-b:v", "5000k"]
+        ffmpeg_cmd += ["-c:v", "h264_qsv", "-preset", "slow", "-b:v", f"{target_bitrate}k"]
     elif gpu_type == "AMD":
-        ffmpeg_cmd += ["-c:v", "h264_amf", "-quality", "slow", "-b:v", "5000k"]
-    elif gpu_type == "APPLE":  # macos apple silicon (m1, m2)
-        ffmpeg_cmd += ["-c:v", "h264_videotoolbox", "-b:v", "5000k"]
+        ffmpeg_cmd += ["-c:v", "h264_amf", "-quality", "slow", "-b:v", f"{target_bitrate}k"]
+    elif gpu_type == "APPLE":  # macOS Apple Silicon (M1, M2)
+        ffmpeg_cmd += ["-c:v", "h264_videotoolbox", "-b:v", f"{target_bitrate}k"]
     else:
-        ffmpeg_cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]
+        ffmpeg_cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-b:v", f"{target_bitrate}k"]
 
-    ffmpeg_cmd += ["-c:a", "aac", "-b:a", "128k", "-progress", "pipe:1", "-stats", output_file]
+    # Set audio codec and final output
+    ffmpeg_cmd += ["-c:a", "aac", "-b:a", "128k", "-stats", output_file]
 
-    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    subprocess.run(ffmpeg_cmd)  # Run FFmpeg with live progress output
 
-    # read ffmpeg output line by line
-    for line in process.stderr:
-        if "frame=" in line:
-            progress_bar.set_description(f"Processing {file}")
-
-    process.wait()
-    progress_bar.update(1)
-
-# run conversions in parallel
+# Run conversions sequentially
 def main():
     gpu_type = detect_gpu()
 
@@ -136,9 +134,9 @@ def main():
         print("No video files found.")
         return
 
-    with tqdm(total=len(video_files), desc="Overall Progress") as progress_bar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(lambda file: convert_video(file, gpu_type, progress_bar), video_files)
+    # Sequential processing of video files
+    for file in video_files:
+        convert_video(file, gpu_type)
 
     print("All files have been processed!")
 
