@@ -1,7 +1,7 @@
 import os, sys, subprocess, platform
 
 # Supported video formats
-SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", "mpg", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V", "MPG")
+SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", "mpg", "3gp", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V", "MPG", "3GP")
 
 # Target bitrate limits
 MAX_BITRATE = 10000  # Max total bitrate in kbps (10 Mbps)
