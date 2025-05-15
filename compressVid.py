@@ -1,4 +1,4 @@
-import os, sys, subprocess, platform
+import os, sys, subprocess, platform, json
 
 # Supported video formats
 SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", "mpg", "3gp", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V", "MPG", "3GP")
@@ -49,25 +49,30 @@ def detect_gpu():
 def get_video_info(file):
     try:
         cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-            "stream=width,height,bit_rate", "-of", "default=noprint_wrappers=1", file
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,bit_rate",
+            "-of", "json",
+            file
         ]
-        output = subprocess.check_output(cmd, text=True).split("\n")
+        output = subprocess.check_output(cmd, text=True)
+        data = json.loads(output)
+        stream = data.get('streams', [{}])[0]
 
-        width, height, bitrate = None, None, None
-        for line in output:
-            if "width=" in line:
-                width = int(line.split("=")[1])
-            if "height=" in line:
-                height = int(line.split("=")[1])
-            if "bit_rate=" in line:
-                bitrate = int(line.split("=")[1]) // 1000  # Convert bps to kbps
+        width = stream.get('width')
+        height = stream.get('height')
+        bitrate = stream.get('bit_rate')
+
+        # Convert bitrate to kbps if present
+        if bitrate is not None:
+            bitrate = int(bitrate) // 1000
 
         return width, height, bitrate
 
     except Exception as e:
-        print(f"Failed to get video info for {file}: {e}")
+        print(f"Error: {e}")
         return None, None, None
+
 
 # Convert video with detected GPU acceleration
 def convert_video(file, gpu_type):
@@ -81,6 +86,9 @@ def convert_video(file, gpu_type):
 
     # Get input resolution & bitrate
     width, height, bitrate = get_video_info(file)
+    print(width, height, bitrate)
+    if bitrate is None:
+        bitrate = MAX_BITRATE
 
     # Determine new bitrate
     if bitrate:
