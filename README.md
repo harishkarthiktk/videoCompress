@@ -11,3 +11,5 @@
 - Multiprocessing is implemented using multithread and concurrent futures, it could be optimized.
 - The TQDM shows overall progress, would be nice to show individual process as well.
 - Tested only on Mac-M1 chip, and Windows with Nvidia card for hardware acceleration, should test on other platforms.
+
+- Harish Karthik
