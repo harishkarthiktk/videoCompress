@@ -1,152 +1,430 @@
-import os, sys, subprocess, platform, json
+#!/usr/bin/env python3
+"""
+Video Compression Script with GPU Acceleration
 
-# Supported video formats
-SUPPORTED_FORMATS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", "mpg", "3gp", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", ".WEBM", ".M4V", "MPG", "3GP")
+This script converts videos to .mp4 format with optimal compression using
+hardware acceleration when available.
 
-# Target bitrate limits
-MAX_BITRATE = 10000  # Max total bitrate in kbps (10 Mbps)
-COMPRESSION_FACTOR = 0.8  # Reduce bitrate by 20%
-MAX_DOWNSCALE_PERCENT = 0.2  # 20% max resolution reduction
+Features:
+- GPU acceleration support (NVIDIA, Intel, AMD, Apple Silicon)
+- Configurable working directory or specific file processing
+- Skips already converted files
+- Intelligent bitrate and resolution optimization
+- Progress tracking and error handling
+"""
 
-'''
-This script converts videos to .mp4 format with optimal compression.
-- Uses GPU acceleration if available.
-- Skips processing if _conv.mp4 already exists.
-- Ensures at least 20% compression if bitrate ≤ 10 Mbps.
-'''
+import os
+import sys
+import subprocess
+import platform
+import json
+import argparse
+import logging
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
-# Detect GPU type (NVIDIA > Intel > AMD > Apple > CPU)
-def detect_gpu():
-    system = platform.system()
-    gpu_type = "CPU"
 
-    try:
-        if system == "Windows":
-            output = subprocess.check_output("wmic path win32_VideoController get Name", shell=True, text=True)
-        elif system == "Linux":
-            output = subprocess.check_output("lspci | grep -i vga", shell=True, text=True)
-        elif system == "Darwin":  # macOS
-            output = subprocess.check_output("system_profiler SPDisplaysDataType", shell=True, text=True)
+# Configuration constants
+@dataclass
+class Config:
+    """Configuration settings for video compression"""
+    SUPPORTED_FORMATS = (
+        ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", 
+        ".mpg", ".3gp", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV", 
+        ".WEBM", ".M4V", ".MPG", ".3GP"
+    )
+    MAX_BITRATE = 10000  # Max total bitrate in kbps (10 Mbps)
+    COMPRESSION_FACTOR = 0.3  # Reduce bitrate by 20%
+    MAX_DOWNSCALE_PERCENT = 0.5  # 20% max resolution reduction
+    AUDIO_BITRATE = "128k"
+    OUTPUT_SUFFIX = "_conv"
+
+
+# Setup logging
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Setup logging configuration"""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger(__name__)
+
+
+class GPUDetector:
+    """Handles GPU detection across different platforms"""
+    
+    @staticmethod
+    def detect() -> str:
+        """Detect available GPU type with priority: NVIDIA > Intel > AMD > Apple > CPU"""
+        system = platform.system()
+        gpu_type = "CPU"
+        
+        try:
+            if system == "Windows":
+                output = subprocess.check_output(
+                    "wmic path win32_VideoController get Name", 
+                    shell=True, text=True, timeout=10
+                )
+            elif system == "Linux":
+                output = subprocess.check_output(
+                    "lspci | grep -i vga", 
+                    shell=True, text=True, timeout=10
+                )
+            elif system == "Darwin":  # macOS
+                output = subprocess.check_output(
+                    "system_profiler SPDisplaysDataType", 
+                    shell=True, text=True, timeout=10
+                )
+            else:
+                return gpu_type
+            
+            output = output.lower()
+            
+            # Priority order detection
+            if "nvidia" in output:
+                gpu_type = "NVIDIA"
+            elif "intel" in output:
+                gpu_type = "INTEL"
+            elif "amd" in output or "radeon" in output:
+                gpu_type = "AMD"
+            elif "apple" in output or "m1" in output or "m2" in output or "m3" in output:
+                gpu_type = "APPLE"
+                
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
+            logging.warning(f"GPU detection failed: {e}")
+        
+        return gpu_type
+
+
+class VideoInfo:
+    """Handles video information extraction"""
+    
+    @staticmethod
+    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        """
+        Extract video resolution and bitrate using ffprobe
+        
+        Returns:
+            Tuple of (width, height, bitrate_kbps) or (None, None, None) on error
+        """
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,bit_rate",
+                "-of", "json",
+                str(file_path)
+            ]
+            
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, check=True
+            )
+            
+            data = json.loads(result.stdout)
+            stream = data.get('streams', [{}])[0]
+            
+            width = stream.get('width')
+            height = stream.get('height')
+            bitrate = stream.get('bit_rate')
+            
+            # Convert bitrate to kbps if present
+            if bitrate is not None:
+                bitrate = int(bitrate) // 1000
+            
+            return width, height, bitrate
+            
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, 
+                json.JSONDecodeError, Exception) as e:
+            logging.error(f"Failed to get video info for {file_path}: {e}")
+            return None, None, None
+
+
+class VideoConverter:
+    """Handles video conversion with GPU acceleration"""
+    
+    def __init__(self, gpu_type: str, config: Config):
+        self.gpu_type = gpu_type
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def _calculate_target_params(self, width: int, height: int, bitrate: Optional[int]) -> Tuple[int, int, int]:
+        """Calculate target resolution and bitrate"""
+        # Handle missing bitrate
+        if bitrate is None or bitrate <= 0:
+            bitrate = self.config.MAX_BITRATE
+        
+        # Determine target bitrate
+        if bitrate > self.config.MAX_BITRATE:
+            target_bitrate = self.config.MAX_BITRATE
         else:
-            return gpu_type  # Default to CPU if OS is unknown
-
-        output = output.lower()
-
-        if "nvidia" in output:
-            gpu_type = "NVIDIA"
-        elif "intel" in output:
-            gpu_type = "INTEL"
-        elif "amd" in output or "radeon" in output:
-            gpu_type = "AMD"
-        elif "apple" in output or "m1" in output or "m2" in output:
-            gpu_type = "APPLE"
-    except Exception as e:
-        print(f"GPU Detection Failed: {e}")
-
-    return gpu_type
-
-# Get video resolution & bitrate
-def get_video_info(file):
-    try:
+            target_bitrate = max(int(bitrate * self.config.COMPRESSION_FACTOR), 500)  # Minimum 500kbps
+        
+        # Calculate new resolution (maximum downscale)
+        scale_factor = 1 - self.config.MAX_DOWNSCALE_PERCENT
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        
+        # Ensure even dimensions for better encoding compatibility
+        new_width = new_width - (new_width % 2)
+        new_height = new_height - (new_height % 2)
+        
+        return new_width, new_height, target_bitrate
+    
+    def _build_ffmpeg_command(self, input_file: Path, output_file: Path, 
+                             new_width: int, new_height: int, target_bitrate: int) -> List[str]:
+        """Build FFmpeg command based on GPU type"""
         cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,bit_rate",
-            "-of", "json",
-            file
+            "ffmpeg", "-y", "-i", str(input_file),
+            "-vf", f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease"
         ]
-        output = subprocess.check_output(cmd, text=True)
-        data = json.loads(output)
-        stream = data.get('streams', [{}])[0]
+        
+        # Select encoder based on GPU type
+        if self.gpu_type == "NVIDIA":
+            cmd.extend(["-c:v", "h264_nvenc", "-preset", "slow", "-b:v", f"{target_bitrate}k"])
+        elif self.gpu_type == "INTEL":
+            cmd.extend(["-c:v", "h264_qsv", "-preset", "slow", "-b:v", f"{target_bitrate}k"])
+        elif self.gpu_type == "AMD":
+            cmd.extend(["-c:v", "h264_amf", "-quality", "slow", "-b:v", f"{target_bitrate}k"])
+        elif self.gpu_type == "APPLE":
+            cmd.extend(["-c:v", "h264_videotoolbox", "-b:v", f"{target_bitrate}k"])
+        else:  # CPU fallback
+            cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-b:v", f"{target_bitrate}k"])
+        
+        # Audio settings and output
+        cmd.extend([
+            "-c:a", "aac", "-b:a", self.config.AUDIO_BITRATE, 
+            "-movflags", "+faststart",  # Web optimization
+            str(output_file)
+        ])
+        
+        return cmd
+    
+    def convert_video(self, input_file: Path) -> bool:
+        """
+        Convert a single video file
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Generate output filename
+            output_file = input_file.parent / f"{input_file.stem}{self.config.OUTPUT_SUFFIX}.mp4"
+            
+            # Skip if already exists
+            if output_file.exists():
+                self.logger.info(f"Skipping {input_file.name} - already converted")
+                return True
+            
+            # Get video info
+            width, height, bitrate = VideoInfo.get_info(input_file)
+            if width is None or height is None:
+                self.logger.error(f"Could not determine video dimensions for {input_file}")
+                return False
+            
+            # Calculate target parameters
+            new_width, new_height, target_bitrate = self._calculate_target_params(width, height, bitrate)
+            
+            self.logger.info(
+                f"Converting {input_file.name} -> {output_file.name} "
+                f"({width}x{height} -> {new_width}x{new_height}, "
+                f"{bitrate or 'unknown'}kbps -> {target_bitrate}kbps) "
+                f"using {self.gpu_type}"
+            )
+            
+            # Build and execute FFmpeg command
+            cmd = self._build_ffmpeg_command(input_file, output_file, new_width, new_height, target_bitrate)
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)  # 1 hour timeout
+            
+            if result.returncode != 0:
+                self.logger.error(f"FFmpeg failed for {input_file}: {result.stderr}")
+                # Clean up partial file
+                if output_file.exists():
+                    output_file.unlink()
+                return False
+            
+            self.logger.info(f"Successfully converted {input_file.name}")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Conversion timeout for {input_file}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error converting {input_file}: {e}")
+            return False
 
-        width = stream.get('width')
-        height = stream.get('height')
-        bitrate = stream.get('bit_rate')
 
-        # Convert bitrate to kbps if present
-        if bitrate is not None:
-            bitrate = int(bitrate) // 1000
-
-        return width, height, bitrate
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, None, None
-
-
-# Convert video with detected GPU acceleration
-def convert_video(file, gpu_type):
-    filename, ext = os.path.splitext(file)
-    output_file = f"{filename}_conv.mp4"
-
-    # Skip if already converted
-    if os.path.exists(output_file):
-        print(f"Skipping {file}, already converted.")
-        return
-
-    # Get input resolution & bitrate
-    width, height, bitrate = get_video_info(file)
-    print(width, height, bitrate)
-    if bitrate is None:
-        bitrate = MAX_BITRATE
-
-    # Determine new bitrate
-    if bitrate:
-        if bitrate > MAX_BITRATE:
-            target_bitrate = MAX_BITRATE  # Limit to 10 Mbps
+class VideoProcessor:
+    """Main video processing orchestrator"""
+    
+    def __init__(self, config: Config, verbose: bool = False):
+        self.config = config
+        self.logger = setup_logging(verbose)
+        self.gpu_type = GPUDetector.detect()
+        self.converter = VideoConverter(self.gpu_type, config)
+        
+        self.logger.info(f"Detected GPU: {self.gpu_type}")
+    
+    def find_video_files(self, directory: Path) -> List[Path]:
+        """Find all supported video files in directory"""
+        video_files = []
+        
+        if not directory.exists() or not directory.is_dir():
+            self.logger.error(f"Directory does not exist: {directory}")
+            return video_files
+        
+        try:
+            for file_path in directory.iterdir():
+                if file_path.is_file() and file_path.suffix in self.config.SUPPORTED_FORMATS:
+                    video_files.append(file_path)
+            
+            self.logger.info(f"Found {len(video_files)} video files in {directory}")
+            return sorted(video_files)
+            
+        except PermissionError:
+            self.logger.error(f"Permission denied accessing directory: {directory}")
+            return video_files
+    
+    def validate_files(self, file_paths: List[str]) -> List[Path]:
+        """Validate and convert file paths to Path objects"""
+        valid_files = []
+        
+        for file_str in file_paths:
+            file_path = Path(file_str)
+            
+            if not file_path.exists():
+                self.logger.warning(f"File does not exist: {file_path}")
+                continue
+            
+            if not file_path.is_file():
+                self.logger.warning(f"Not a file: {file_path}")
+                continue
+            
+            if file_path.suffix not in self.config.SUPPORTED_FORMATS:
+                self.logger.warning(f"Unsupported format: {file_path}")
+                continue
+            
+            valid_files.append(file_path)
+        
+        return valid_files
+    
+    def process_files(self, files: List[Path], max_workers: int = 1) -> None:
+        """Process video files (sequential or parallel)"""
+        if not files:
+            self.logger.warning("No files to process")
+            return
+        
+        successful = 0
+        failed = 0
+        
+        if max_workers == 1:
+            # Sequential processing
+            for file_path in files:
+                if self.converter.convert_video(file_path):
+                    successful += 1
+                else:
+                    failed += 1
         else:
-            target_bitrate = int(bitrate * COMPRESSION_FACTOR)  # Reduce by 20%
+            # Parallel processing (use with caution - resource intensive)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_file = {
+                    executor.submit(self.converter.convert_video, file_path): file_path 
+                    for file_path in files
+                }
+                
+                for future in as_completed(future_to_file):
+                    if future.result():
+                        successful += 1
+                    else:
+                        failed += 1
+        
+        self.logger.info(f"Processing complete: {successful} successful, {failed} failed")
 
-    # Calculate the new resolution (maximum 20% downscale)
-    new_width = int(width * (1 - MAX_DOWNSCALE_PERCENT))
-    new_height = int(height * (1 - MAX_DOWNSCALE_PERCENT))
 
-    print(f"Processing: {file} -> {output_file} using {gpu_type}")
+def check_dependencies() -> bool:
+    """Check if required dependencies are available"""
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=10)
+        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True, timeout=10)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
-    # Downscale while maintaining aspect ratio and limit bitrate
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-i", file, "-vf",
-        f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease"
-    ]
 
-    # Select GPU encoder if available
-    if gpu_type == "NVIDIA":
-        ffmpeg_cmd += ["-c:v", "h264_nvenc", "-preset", "slow", "-b:v", f"{target_bitrate}k"]
-    elif gpu_type == "INTEL":
-        ffmpeg_cmd += ["-c:v", "h264_qsv", "-preset", "slow", "-b:v", f"{target_bitrate}k"]
-    elif gpu_type == "AMD":
-        ffmpeg_cmd += ["-c:v", "h264_amf", "-quality", "slow", "-b:v", f"{target_bitrate}k"]
-    elif gpu_type == "APPLE":  # macOS Apple Silicon (M1, M2)
-        ffmpeg_cmd += ["-c:v", "h264_videotoolbox", "-b:v", f"{target_bitrate}k"]
-    else:
-        ffmpeg_cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-b:v", f"{target_bitrate}k"]
-
-    # Set audio codec and final output
-    ffmpeg_cmd += ["-c:a", "aac", "-b:a", "128k", "-stats", output_file]
-
-    subprocess.run(ffmpeg_cmd)  # Run FFmpeg with live progress output
-
-# Run conversions sequentially
 def main():
-    gpu_type = detect_gpu()
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="Convert videos to .mp4 with optimal compression and GPU acceleration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -w /path/to/videos          # Process all videos in directory
+  %(prog)s -f video1.mkv video2.avi   # Process specific files
+  %(prog)s -w . -v                     # Process current directory with verbose output
+        """
+    )
+    
+    # Mutually exclusive group for working directory or specific files
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "-w", "--working-dir",
+        type=str,
+        help="Directory containing videos to process"
+    )
+    group.add_argument(
+        "-f", "--files",
+        nargs="+",
+        help="Specific video files to process (space-separated)"
+    )
+    
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Maximum parallel workers (default: 1, sequential)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Check dependencies
+    if not check_dependencies():
+        print("Error: FFmpeg and FFprobe are required but not found in PATH")
+        print("Please install FFmpeg: https://ffmpeg.org/download.html")
+        sys.exit(1)
+    
+    # Initialize processor
+    config = Config()
+    processor = VideoProcessor(config, args.verbose)
+    
+    try:
+        if args.working_dir:
+            # Process directory
+            directory = Path(args.working_dir).resolve()
+            files = processor.find_video_files(directory)
+        else:
+            # Process specific files
+            files = processor.validate_files(args.files)
+        
+        # Process the files
+        processor.process_files(files, args.max_workers)
+        
+    except KeyboardInterrupt:
+        processor.logger.info("Processing interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        processor.logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
 
-    arg_path = sys.argv[1] if len(sys.argv) > 1 else None
-    if arg_path:
-        print(f"Running script in path: {arg_path}")
-        os.chdir(arg_path)
-    else:
-        print("No path was provided, running from script's root.")
-
-    video_files = [f for f in os.listdir() if f.endswith(SUPPORTED_FORMATS)]
-    if not video_files:
-        print("No video files found.")
-        return
-
-    # Sequential processing of video files
-    for file in video_files:
-        convert_video(file, gpu_type)
-
-    print("All files have been processed!")
 
 if __name__ == "__main__":
     main()
