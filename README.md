@@ -1,15 +1,71 @@
-# videoCompress
-- A simple commandline utility using python to compress video files to a smaller file, while keeping optimized quality.
+# Video Processing Tools
 
-## Requirement:
-- Videos shot on the phone are large, and often the memory is more important than the absolute clarity of the video.
-- All utils available online focus on UI and variable options, but I only care for a simple utility.
-- Either an argument can passed to operate on a different folder, or the script will operate in the location where the script is present.
+This repository contains two Python scripts for handling common video-processing tasks using **FFmpeg**:
 
-## Future Enhancements:
-- Add a GUI using Tkinter for path selection alone, since it adds ease.
-- Multiprocessing is implemented using multithread and concurrent futures, it could be optimized.
-- The TQDM shows overall progress, would be nice to show individual process as well.
-- Tested only on Mac-M1 chip, and Windows with Nvidia card for hardware acceleration, should test on other platforms.
+1. **`compressVid.py`** – Compress and convert videos with GPU acceleration.
+2. **`extractAudio.py`** – Extract audio tracks from video files into MP3 or AAC.
 
-- Harish Karthik
+---
+
+## Requirements
+
+* Python 3.7+
+* [FFmpeg](https://ffmpeg.org/download.html) (must be installed and available in your system PATH)
+
+---
+
+## Scripts
+
+### 1. `compressVid.py`
+
+Compresses video files into `.mp4` format with GPU acceleration where available.
+Features include:
+
+* GPU support (NVIDIA, Intel, AMD, Apple Silicon) with CPU fallback
+* Automatic bitrate and resolution optimization
+* Skips already converted files
+* Sequential or parallel batch processing
+
+**Examples:**
+
+```bash
+# Compress all videos in a directory
+python3 compressVid.py -w /path/to/videos
+
+# Compress specific files
+python3 compressVid.py -f video1.mkv video2.avi
+
+# Verbose mode
+python3 compressVid.py -w . -v
+```
+
+---
+
+### 2. `extractAudio.py`
+
+Extracts audio tracks from video files and saves them as MP3 or AAC.
+Features include:
+
+* Configurable output format (`mp3` or `aac`)
+* Default bitrates: 192 kbps for MP3, 128 kbps for AAC
+* Ability to exclude files by name
+* Sequential or parallel batch processing
+
+**Examples:**
+
+```bash
+# Extract AAC audio from all videos in a directory
+python3 extractAudio.py -w /path/to/videos --output-format aac
+
+# Extract MP3 audio from specific files
+python3 extractAudio.py -f video1.mkv video2.avi --output-format mp3
+
+# Exclude files containing "sample" in the name
+python3 extractAudio.py -w . --exclude sample --output-format mp3
+```
+
+---
+
+## Notes
+* Both scripts automatically skip files that have already been processed.
+* Parallel processing can be enabled with `--max-workers`, but may be resource-intensive.
