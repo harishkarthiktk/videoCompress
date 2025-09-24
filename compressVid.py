@@ -387,21 +387,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -w /path/to/videos          # Process all videos in directory
-  %(prog)s -f video1.mkv video2.avi   # Process specific files
-  %(prog)s -w . -v                     # Process current directory with verbose output
+  %(prog)s -W /path/to/videos          # Process all videos in directory
+  %(prog)s -F video1.mkv video2.avi   # Process specific files
+  %(prog)s -W . -v                     # Process current directory with verbose output
         """
     )
 
     # Mutually exclusive group for working directory or specific files
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
-        "-w", "--working-dir",
+        "-W", "--working-dir",
         type=str,
         help="Directory containing videos to process"
     )
     group.add_argument(
-        "-f", "--files",
+        "-F", "--files",
         nargs="+",
         help="Specific video files to process (space-separated)"
     )

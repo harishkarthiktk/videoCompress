@@ -202,15 +202,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -w /path/to/videos --output-format aac   # Extract AAC audio
-  %(prog)s -f video1.mkv video2.avi --output-format mp3
-  %(prog)s -w . --exclude sample --output-format mp3
+  %(prog)s -W /path/to/videos --output-format aac   # Extract AAC audio
+  %(prog)s -F video1.mkv video2.avi --output-format mp3
+  %(prog)s -W . --exclude sample --output-format mp3
         """
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-w", "--working-dir", type=str, help="Directory containing videos to process")
-    group.add_argument("-f", "--files", nargs="+", help="Specific video files to process (space-separated)")
+    group.add_argument("-W", "--working-dir", type=str, help="Directory containing videos to process")
+    group.add_argument("-F", "--files", nargs="+", help="Specific video files to process (space-separated)")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--max-workers", type=int, default=1, help="Maximum parallel workers (default: 1)")
