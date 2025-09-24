@@ -39,7 +39,7 @@ class Config:
         ".WEBM", ".M4V", ".MPG", ".3GP"
     )
     MAX_BITRATE = 10000  # Max total bitrate in kbps (10 Mbps)
-    COMPRESSION_FACTOR = 0.7  # Reduce bitrate by 30%
+    compression_factor: float = 0.7  # Compression factor (0.0-1.0, as decimal of original bitrate; set via --compression-factor)
     MAX_DOWNSCALE_PERCENT = 0.5  # 20% max resolution reduction
     OUTPUT_SUFFIX = "_conv"
     MIN_AUDIO_BITRATE = 64 # Minimum audio bitrate in kbps
@@ -194,12 +194,12 @@ class VideoConverter:
         if video_bitrate is None or video_bitrate <= 0:
             target_video_bitrate = self.config.MAX_BITRATE
         else:
-            target_video_bitrate = int(video_bitrate * self.config.COMPRESSION_FACTOR)
+            target_video_bitrate = int(video_bitrate * self.config.compression_factor)
 
         if audio_bitrate is None or audio_bitrate <= 0:
             target_audio_bitrate = 128
         else:
-            target_audio_bitrate = max(int(audio_bitrate * self.config.COMPRESSION_FACTOR), self.config.MIN_AUDIO_BITRATE)
+            target_audio_bitrate = max(int(audio_bitrate * self.config.compression_factor), self.config.MIN_AUDIO_BITRATE)
 
         # Print warnings for low bitrates
         if target_video_bitrate < 500:
@@ -536,6 +536,7 @@ Examples:
   %(prog)s -W /path/to/videos          # Process all videos in directory
   %(prog)s -F video1.mkv video2.avi   # Process specific files
   %(prog)s -W . -v                     # Process current directory with verbose output
+  %(prog)s -W . -C 50                  # Process with 50% compression factor
         """
     )
 
@@ -565,6 +566,13 @@ Examples:
         help="Maximum parallel workers (default: 1, sequential)"
     )
 
+    parser.add_argument(
+        "-C", "--compression-factor",
+        type=float,
+        default=70.0,
+        help="Compression factor as percentage of original bitrate (0-100, default: 70)"
+    )
+
     args = parser.parse_args()
 
     # Check dependencies
@@ -574,7 +582,11 @@ Examples:
         sys.exit(1)
 
     # Initialize processor
-    config = Config()
+    compression_factor = args.compression_factor / 100.0
+    if not 0 <= compression_factor <= 1:
+        print("Error: Compression factor must be between 0 and 100")
+        sys.exit(1)
+    config = Config(compression_factor=compression_factor)
     processor = VideoProcessor(config, args.verbose)
 
     try:
