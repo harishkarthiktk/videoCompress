@@ -109,11 +109,11 @@ class VideoInfo:
     @staticmethod
     def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], Optional[int]]:
         """
-        Extract video resolution, bitrates, audio presence, duration, and frame count using ffprobe
-
+        Extract video resolution, bitrates, audio presence, duration, frame count, and rotation using ffprobe
+ 
         Returns:
-            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames)
-            or (None, None, None, False, None, None, None) on error
+            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees)
+            or (None, None, None, False, None, None, None, 0) on error
         """
         try:
             cmd = [
@@ -172,20 +172,32 @@ class VideoInfo:
                 except (ValueError, TypeError):
                     nb_frames = -1
 
-            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames
+            # Detect rotation from side data (direct rotation field)
+            rotation = 0
+            side_data_list = video_stream.get('side_data_list', [])
+            for side in side_data_list:
+                if side.get('side_data_type') == 'Display Matrix' and 'rotation' in side:
+                    try:
+                        rotation = int(side['rotation'])
+                    except (ValueError, TypeError):
+                        rotation = 0
+                    break
+ 
+            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 json.JSONDecodeError, Exception) as e:
             logging.error(f"Failed to get video info for {file_path}: {e}")
-            return None, None, None, False, None
+            return None, None, None, False, None, None, None, 0
 
 
 class VideoConverter:
     """Handles video conversion with GPU acceleration"""
 
-    def __init__(self, gpu_type: str, config: Config):
+    def __init__(self, gpu_type: str, config: Config, logs_dir: Path):
         self.gpu_type = gpu_type
         self.config = config
+        self.logs_dir = logs_dir
         self.logger = logging.getLogger(__name__)
 
     def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int]) -> Tuple[int, int, int, int]:
@@ -225,11 +237,19 @@ class VideoConverter:
         return new_width, new_height, target_video_bitrate, target_audio_bitrate
 
     def _build_ffmpeg_command(self, input_file: Path, output_file: Path,
-                             new_width: int, new_height: int, target_video_bitrate: int, target_audio_bitrate: int) -> List[str]:
+                             new_width: int, new_height: int, target_video_bitrate: int, target_audio_bitrate: int, rotation: int = 0) -> List[str]:
         """Build FFmpeg command based on GPU type"""
+        transpose_str = ""
+        if rotation == 90:
+            transpose_str = "transpose=1,"
+        elif rotation == 270:
+            transpose_str = "transpose=2,"
+        elif rotation == 180:
+            transpose_str = "transpose=1,transpose=1,"
+
         cmd = [
             "ffmpeg", "-y", "-i", str(input_file),
-            "-vf", f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease",
+            "-vf", transpose_str + f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease",
             "-progress", "pipe:1"
         ]
 
@@ -281,7 +301,7 @@ class VideoConverter:
                 return True
 
             # Get video info
-            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames = VideoInfo.get_info(input_file)
+            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation = VideoInfo.get_info(input_file)
             if width is None or height is None:
                 self.logger.error(f"Could not determine video dimensions for {input_file}")
                 if pbar:
@@ -307,18 +327,18 @@ class VideoConverter:
 
             # Calculate target parameters
             new_width, new_height, target_video_bitrate, target_audio_bitrate = self._calculate_target_params(width, height, video_bitrate, audio_bitrate)
-
+ 
             self.logger.info(
                 f"Converting {input_file.name} -> {output_file.name} "
                 f"({width}x{height} -> {new_width}x{new_height}, "
                 f"Video: {video_bitrate or 'unknown'}kbps -> {target_video_bitrate}kbps, "
                 f"Audio: {audio_bitrate or 'unknown'}kbps -> {target_audio_bitrate}kbps, "
-                f"Duration: {duration}s, Frames: {nb_frames}) "
+                f"Duration: {duration}s, Frames: {nb_frames}, Rotation: {rotation}°) "
                 f"using {self.gpu_type}"
             )
 
             # Build and execute FFmpeg command
-            cmd = self._build_ffmpeg_command(input_file, output_file, new_width, new_height, target_video_bitrate, target_audio_bitrate)
+            cmd = self._build_ffmpeg_command(input_file, output_file, new_width, new_height, target_video_bitrate, target_audio_bitrate, rotation)
 
             # Use Popen for streaming progress output
             proc = subprocess.Popen(
@@ -363,7 +383,13 @@ class VideoConverter:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-                self.logger.error(f"Conversion timeout for {input_file}")
+                log_path = self.logs_dir / f"{input_file.stem}_timeout.log"
+                with open(log_path, 'w') as f:
+                    f.write(f"FFmpeg Command: {' '.join(cmd)}\n\n")
+                    f.write("Output:\n")
+                    for line in output_lines:
+                        f.write(line + '\n')
+                self.logger.error(f"Conversion timeout for {input_file}; full log saved to {log_path}")
                 if pbar:
                     pbar.n = pbar.total  # Mark as complete/failed
                     pbar.close()
@@ -372,8 +398,14 @@ class VideoConverter:
                 return False
 
             if proc.returncode != 0:
+                log_path = self.logs_dir / f"{input_file.stem}_ffmpeg_error.log"
+                with open(log_path, 'w') as f:
+                    f.write(f"FFmpeg Command: {' '.join(cmd)}\n\n")
+                    f.write("Output:\n")
+                    for line in output_lines:
+                        f.write(line + '\n')
                 error_msg = ' '.join(output_lines[-10:]) if output_lines else "Unknown error"
-                self.logger.error(f"FFmpeg failed for {input_file}: {error_msg}")
+                self.logger.error(f"FFmpeg failed for {input_file}: {error_msg} (full log: {log_path})")
                 if pbar:
                     pbar.n = pbar.total  # Mark as failed
                     pbar.close()
@@ -403,9 +435,11 @@ class VideoProcessor:
     def __init__(self, config: Config, verbose: bool = False):
         self.config = config
         self.logger = setup_logging(verbose)
+        self.logs_dir = Path("logs")
+        os.makedirs(self.logs_dir, exist_ok=True)
         self.gpu_type = GPUDetector.detect()
-        self.converter = VideoConverter(self.gpu_type, config)
-
+        self.converter = VideoConverter(self.gpu_type, config, self.logs_dir)
+    
         self.logger.info(f"Detected GPU: {self.gpu_type}")
 
     def find_video_files(self, directory: Path) -> List[Path]:
