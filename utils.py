@@ -33,6 +33,7 @@ class Config:
     MAX_DOWNSCALE_PERCENT: float = 0.5  # Max resolution reduction
     OUTPUT_SUFFIX: str = "_conv"
     MIN_AUDIO_BITRATE: int = 64  # Minimum audio bitrate in kbps
+    use_adaptive: bool = True  # Use adaptive compression factors based on metadata
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
     """Setup logging configuration"""
@@ -102,13 +103,14 @@ class VideoInfo:
     """Handles video information extraction"""
 
     @staticmethod
-    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], int, int, Optional[float]]:
+    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], int, int, Optional[float], Optional[str]]:
         """
-        Extract video resolution, bitrates, audio presence, duration, nb_frames, rotation, fps using ffprobe
+        Extract video resolution, bitrates, audio presence, duration, nb_frames, rotation, fps, codec using ffprobe.
+        Supports adaptive compression by including codec for inefficiency detection.
 
         Returns:
-            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees, fps)
-            or (None, None, None, False, None, None, -1, 0, None) on error
+            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees, fps, codec_name)
+            or (None, None, None, False, None, None, -1, 0, None, None) on error
         """
         try:
             cmd = [
@@ -131,7 +133,7 @@ class VideoInfo:
 
             if not video_stream:
                 logging.error(f"No video stream found in {file_path}")
-                return None, None, None, False, None, None, -1, 0, None
+                return None, None, None, False, None, None, -1, 0, None, None
 
             width_str = video_stream.get('width')
             width = int(width_str) if width_str is not None else None
@@ -187,12 +189,15 @@ class VideoInfo:
                 except (ValueError, TypeError, NameError, ZeroDivisionError):
                     fps = None
 
-            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps
+            # Extract codec name
+            codec = video_stream.get('codec_name')
+
+            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 json.JSONDecodeError, Exception) as e:
             logging.error(f"Failed to get video info for {file_path}: {e}")
-            return None, None, None, False, None, None, -1, 0, None
+            return None, None, None, False, None, None, -1, 0, None, None
 
 class VideoConverter:
     """Handles video conversion with GPU acceleration"""
@@ -205,39 +210,135 @@ class VideoConverter:
         self.per_file_callback = per_file_callback
         self.logger = logging.getLogger(__name__)
 
-    def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int]) -> Tuple[int, int, int, int]:
-        """Calculate target resolution and bitrates"""
-        # Handle missing bitrates
+    def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int], duration: Optional[float] = None, codec: Optional[str] = None) -> Tuple[int, int, int, int]:
+        """
+        Calculate target resolution and bitrates with adaptive logic if enabled.
+        Adaptive mode adjusts factors based on bitrate, resolution, duration, and codec for better efficiency.
+        Falls back to static compression_factor if use_adaptive=False in Config.
+        """
+        if not self.config.use_adaptive:
+            # Fallback to static calculation for backward compatibility
+            # Handle missing bitrates
+            if video_bitrate is None or video_bitrate <= 0:
+                target_video_bitrate = self.config.MAX_BITRATE
+            else:
+                target_video_bitrate = int(video_bitrate * self.config.compression_factor)
+
+            if audio_bitrate is None or audio_bitrate <= 0:
+                target_audio_bitrate = 128
+            else:
+                target_audio_bitrate = max(int(audio_bitrate * self.config.compression_factor), self.config.MIN_AUDIO_BITRATE)
+
+            # Print warnings for low bitrates
+            if target_video_bitrate < 500:
+                self.logger.warning(
+                    f"Video bitrate will be compressed to {target_video_bitrate}kbps, which is below the "
+                    "suggested 500kbps threshold and may result in noticeable quality loss."
+                )
+            if target_audio_bitrate < 128:
+                self.logger.warning(
+                    f"Audio bitrate will be compressed to {target_audio_bitrate}kbps, which is below the "
+                    "suggested 128kbps threshold and may result in noticeable quality loss."
+                )
+
+            # Calculate new resolution (maximum downscale)
+            scale_factor = 1 - self.config.MAX_DOWNSCALE_PERCENT
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+
+            # Ensure even dimensions for better encoding compatibility
+            new_width = new_width - (new_width % 2)
+            new_height = new_height - (new_height % 2)
+
+            self.logger.info(f"Using static compression: factor={self.config.compression_factor}, downscale={self.config.MAX_DOWNSCALE_PERCENT}")
+            return new_width, new_height, target_video_bitrate, target_audio_bitrate
+
+        # Adaptive logic
+        # Thresholds
+        HIGH_BITRATE_THRESHOLD = 8000  # kbps
+        LOW_BITRATE_THRESHOLD = 2000   # kbps
+        HD_HEIGHT = 1080
+        FOURK_HEIGHT = 2160
+        LONG_DURATION = 3600  # seconds
+        INEFFICIENT_CODECS = {'mpeg4', 'wmv2', 'msmpeg4'}
+
+        # Base factors
+        base_factor = self.config.compression_factor  # 0.7 default
+        video_factor = base_factor
+        audio_factor = base_factor
+        downscale_factor = self.config.MAX_DOWNSCALE_PERCENT  # 0.5 max
+
+        # Bitrate-based adjustment for video
+        if video_bitrate is not None and video_bitrate > 0:
+            if video_bitrate > HIGH_BITRATE_THRESHOLD:
+                video_factor = max(0.4, base_factor - 0.2)
+            elif video_bitrate < LOW_BITRATE_THRESHOLD:
+                video_factor = min(0.9, base_factor + 0.2)
+                if video_bitrate < 1000:
+                    self.logger.info("Low bitrate video detected; skipping compression.")
+                    video_factor = 1.0  # No compression
+
+        # Resolution-based downscale
+        if height > FOURK_HEIGHT:
+            downscale_factor = 0.5
+        elif height > HD_HEIGHT:
+            downscale_factor = 0.3
+        else:
+            downscale_factor = 0.0  # No downscale for SD/HD
+
+        # Duration adjustment (slight leniency for long videos to prioritize speed)
+        if duration is not None and duration > LONG_DURATION:
+            video_factor = min(0.95, video_factor + 0.05)
+
+        # Codec adjustment for inefficient codecs
+        if codec in INEFFICIENT_CODECS:
+            video_factor = min(0.9, video_factor + 0.1)
+            self.logger.info(f"Inefficient codec '{codec}' detected; adjusting factor to {video_factor}")
+
+        # Audio factor (more conservative)
+        if audio_bitrate is not None and audio_bitrate > 128:
+            audio_factor = video_factor
+        else:
+            audio_factor = 0.8  # Fixed for low/no audio
+
+        # Calculate targets
         if video_bitrate is None or video_bitrate <= 0:
             target_video_bitrate = self.config.MAX_BITRATE
         else:
-            target_video_bitrate = int(video_bitrate * self.config.compression_factor)
+            target_video_bitrate = int(video_bitrate * video_factor)
 
         if audio_bitrate is None or audio_bitrate <= 0:
             target_audio_bitrate = 128
         else:
-            target_audio_bitrate = max(int(audio_bitrate * self.config.compression_factor), self.config.MIN_AUDIO_BITRATE)
+            target_audio_bitrate = max(int(audio_bitrate * audio_factor), self.config.MIN_AUDIO_BITRATE)
 
-        # Print warnings for low bitrates
+        # Clamp factors
+        target_video_bitrate = max(500, min(target_video_bitrate, self.config.MAX_BITRATE))  # Avoid too low/high
+        target_audio_bitrate = max(self.config.MIN_AUDIO_BITRATE, min(target_audio_bitrate, 320))  # Reasonable audio range
+
+        # Warnings
         if target_video_bitrate < 500:
             self.logger.warning(
-                f"Video bitrate will be compressed to {target_video_bitrate}kbps, which is below the "
-                "suggested 500kbps threshold and may result in noticeable quality loss."
+                f"Adaptive video bitrate {target_video_bitrate}kbps below 500kbps threshold; quality loss possible."
             )
         if target_audio_bitrate < 128:
             self.logger.warning(
-                f"Audio bitrate will be compressed to {target_audio_bitrate}kbps, which is below the "
-                "suggested 128kbps threshold and may result in noticeable quality loss."
+                f"Adaptive audio bitrate {target_audio_bitrate}kbps below 128kbps threshold; quality loss possible."
             )
 
-        # Calculate new resolution (maximum downscale)
-        scale_factor = 1 - self.config.MAX_DOWNSCALE_PERCENT
+        # Resolution
+        scale_factor = 1 - downscale_factor
         new_width = int(width * scale_factor)
         new_height = int(height * scale_factor)
 
-        # Ensure even dimensions for better encoding compatibility
+        # Ensure even dimensions
         new_width = new_width - (new_width % 2)
         new_height = new_height - (new_height % 2)
+
+        self.logger.info(
+            f"Adaptive compression: video_factor={video_factor:.2f}, audio_factor={audio_factor:.2f}, "
+            f"downscale={downscale_factor:.2f} (bitrate={video_bitrate}kbps, height={height}, duration={duration}s, codec={codec})"
+        )
 
         return new_width, new_height, target_video_bitrate, target_audio_bitrate
 
@@ -268,7 +369,13 @@ class VideoConverter:
         elif self.gpu_type == "APPLE":
             cmd.extend(["-c:v", "h264_videotoolbox", "-b:v", f"{target_video_bitrate}k"])
         else:  # CPU fallback - use CRF like original CLI for quality focus
-            cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium"])
+            # Adaptive CRF for CPU: base 23, adjust based on factor (lower CRF = higher quality/less compression)
+            if self.config.use_adaptive:
+                crf = max(18, min(28, 23 + int((1 - self.config.compression_factor) * 10)))
+                self.logger.info(f"Adaptive CRF for CPU: {crf}")
+                cmd.extend(["-c:v", "libx264", "-crf", str(crf), "-preset", "medium"])
+            else:
+                cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium"])
 
         # Audio settings and output
         cmd.extend([
@@ -303,7 +410,7 @@ class VideoConverter:
 
             # Get video info (unified return)
             info = VideoInfo.get_info(input_file)
-            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps = info
+            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec = info
             if width is None or height is None:
                 self.logger.error(f"Could not determine video dimensions for {input_file}")
                 if pbar:
@@ -333,7 +440,7 @@ class VideoConverter:
 
             # Calculate target parameters
             new_width, new_height, target_video_bitrate, target_audio_bitrate = self._calculate_target_params(
-                width, height, video_bitrate, audio_bitrate
+                width, height, video_bitrate, audio_bitrate, duration=duration, codec=codec
             )
 
             self.logger.info(
@@ -341,7 +448,7 @@ class VideoConverter:
                 f"({width}x{height} -> {new_width}x{new_height}, "
                 f"Video: {video_bitrate or 'unknown'}kbps -> {target_video_bitrate}kbps, "
                 f"Audio: {audio_bitrate or 'unknown'}kbps -> {target_audio_bitrate}kbps, "
-                f"Duration: {duration}s, Frames: {nb_frames}, Rotation: {rotation}°) "
+                f"Duration: {duration}s, Frames: {nb_frames}, Rotation: {rotation}°, Codec: {codec}) "
                 f"using {self.gpu_type}"
             )
 
