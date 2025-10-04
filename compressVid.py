@@ -11,6 +11,7 @@ Features:
 - Skips already converted files
 - Intelligent bitrate and resolution optimization
 - Progress tracking with tqdm (overall files and per-file FFmpeg progress) and error handling
+- Option to move original files to 'original_files' folder after conversion
 """
 
 import os
@@ -29,6 +30,11 @@ from dataclasses import dataclass
 # Configuration constants
 import tqdm
 from tqdm import tqdm
+
+# Global timeout constants
+GPU_DETECT_TIMEOUT = 10
+FFPROBE_TIMEOUT = 30
+FFMPEG_TIMEOUT = 3600
 
 @dataclass
 class Config:
@@ -70,17 +76,17 @@ class GPUDetector:
             if system == "Windows":
                 output = subprocess.check_output(
                     "wmic path win32_VideoController get Name",
-                    shell=True, text=True, timeout=10
+                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
                 )
             elif system == "Linux":
                 output = subprocess.check_output(
                     "lspci | grep -i vga",
-                    shell=True, text=True, timeout=10
+                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
                 )
             elif system == "Darwin":  # macOS
                 output = subprocess.check_output(
                     "system_profiler SPDisplaysDataType",
-                    shell=True, text=True, timeout=10
+                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
                 )
             else:
                 return gpu_type
@@ -107,10 +113,10 @@ class VideoInfo:
     """Handles video information extraction"""
 
     @staticmethod
-    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], Optional[int]]:
+    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], Optional[int], int]:
         """
         Extract video resolution, bitrates, audio presence, duration, frame count, and rotation using ffprobe
- 
+  
         Returns:
             Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees)
             or (None, None, None, False, None, None, None, 0) on error
@@ -124,7 +130,7 @@ class VideoInfo:
             ]
 
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, check=True
+                cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT, check=True
             )
 
             data = json.loads(result.stdout)
@@ -136,7 +142,7 @@ class VideoInfo:
 
             if not video_stream:
                 logging.error(f"No video stream found in {file_path}")
-                return None, None, None, False, None
+                return None, None, None, False, None, None, None, 0
 
             width_str = video_stream.get('width')
             width = int(width_str) if width_str is not None else None
@@ -182,7 +188,7 @@ class VideoInfo:
                     except (ValueError, TypeError):
                         rotation = 0
                     break
- 
+  
             return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
@@ -194,10 +200,11 @@ class VideoInfo:
 class VideoConverter:
     """Handles video conversion with GPU acceleration"""
 
-    def __init__(self, gpu_type: str, config: Config, logs_dir: Path):
+    def __init__(self, gpu_type: str, config: Config, logs_dir: Path, move_files: bool = False):
         self.gpu_type = gpu_type
         self.config = config
         self.logs_dir = logs_dir
+        self.move_files = move_files
         self.logger = logging.getLogger(__name__)
 
     def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int]) -> Tuple[int, int, int, int]:
@@ -239,17 +246,17 @@ class VideoConverter:
     def _build_ffmpeg_command(self, input_file: Path, output_file: Path,
                              new_width: int, new_height: int, target_video_bitrate: int, target_audio_bitrate: int, rotation: int = 0) -> List[str]:
         """Build FFmpeg command based on GPU type"""
-        transpose_str = ""
+        rotate_str = ""
         if rotation == 90:
-            transpose_str = "transpose=1,"
-        elif rotation == 270:
-            transpose_str = "transpose=2,"
+            rotate_str = "rotate=PI/2,"
         elif rotation == 180:
-            transpose_str = "transpose=1,transpose=1,"
+            rotate_str = "rotate=PI,"
+        elif rotation == 270:
+            rotate_str = "rotate=3*PI/2,"
 
         cmd = [
             "ffmpeg", "-y", "-i", str(input_file),
-            "-vf", transpose_str + f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease",
+            "-vf", rotate_str + f"scale='min(iw,{new_width})':'min(ih,{new_height})':force_original_aspect_ratio=decrease",
             "-progress", "pipe:1"
         ]
 
@@ -263,7 +270,7 @@ class VideoConverter:
         elif self.gpu_type == "APPLE":
             cmd.extend(["-c:v", "h264_videotoolbox", "-b:v", f"{target_video_bitrate}k"])
         else:  # CPU fallback
-            cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-b:v", f"{target_video_bitrate}k"])
+            cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium"])
 
         # Audio settings and output
         cmd.extend([
@@ -327,7 +334,7 @@ class VideoConverter:
 
             # Calculate target parameters
             new_width, new_height, target_video_bitrate, target_audio_bitrate = self._calculate_target_params(width, height, video_bitrate, audio_bitrate)
- 
+  
             self.logger.info(
                 f"Converting {input_file.name} -> {output_file.name} "
                 f"({width}x{height} -> {new_width}x{new_height}, "
@@ -379,7 +386,7 @@ class VideoConverter:
                                         current_time_ms = time_ms
                                 except (ValueError, IndexError):
                                     pass  # Ignore parse errors
-                proc.wait(timeout=3600)
+                proc.wait(timeout=FFMPEG_TIMEOUT)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
@@ -419,6 +426,18 @@ class VideoConverter:
                 pbar.close()
 
             self.logger.info(f"Successfully converted {input_file.name}")
+
+            # Move original file if requested
+            if self.move_files:
+                original_dir = input_file.parent / "original_files"
+                original_dir.mkdir(exist_ok=True)
+                new_path = original_dir / input_file.name
+                try:
+                    input_file.rename(new_path)
+                    self.logger.info(f"Moved original {input_file.name} to {original_dir}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to move {input_file.name} to {original_dir}: {e}")
+
             return True
 
         except Exception as e:
@@ -432,13 +451,14 @@ class VideoConverter:
 class VideoProcessor:
     """Main video processing orchestrator"""
 
-    def __init__(self, config: Config, verbose: bool = False):
+    def __init__(self, config: Config, verbose: bool = False, move_files: bool = False):
         self.config = config
+        self.move_files = move_files
         self.logger = setup_logging(verbose)
         self.logs_dir = Path("logs")
         os.makedirs(self.logs_dir, exist_ok=True)
         self.gpu_type = GPUDetector.detect()
-        self.converter = VideoConverter(self.gpu_type, config, self.logs_dir)
+        self.converter = VideoConverter(self.gpu_type, config, self.logs_dir, move_files)
     
         self.logger.info(f"Detected GPU: {self.gpu_type}")
 
@@ -553,8 +573,8 @@ class VideoProcessor:
 def check_dependencies() -> bool:
     """Check if required dependencies are available"""
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=10)
-        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True, timeout=10)
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=FFPROBE_TIMEOUT)
+        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True, timeout=FFPROBE_TIMEOUT)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -567,22 +587,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -W /path/to/videos          # Process all videos in directory
-  %(prog)s -F video1.mkv video2.avi   # Process specific files
-  %(prog)s -W . -v                     # Process current directory with verbose output
-  %(prog)s -W . -C 50                  # Process with 50% compression factor
+  compressvid_v2.py -w /path/to/videos          # Process all videos in directory
+  compressvid_v2.py -f video1.mkv video2.avi   # Process specific files
+  compressvid_v2.py -w . -v                     # Process current directory with verbose output
+  compressvid_v2.py -w . -c 50                  # Process with 50% compression factor
+  compressvid_v2.py -w . -m                     # Process and move originals to 'original_files'
         """
     )
 
     # Mutually exclusive group for working directory or specific files
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
-        "-W", "--working-dir",
+        "-w", "--working-dir",
         type=str,
         help="Directory containing videos to process"
     )
     group.add_argument(
-        "-F", "--files",
+        "-f", "--files",
         nargs="+",
         help="Specific video files to process (space-separated)"
     )
@@ -601,10 +622,16 @@ Examples:
     )
 
     parser.add_argument(
-        "-C", "--compression-factor",
+        "-c", "--compression-factor",
         type=float,
         default=70.0,
         help="Compression factor as percentage of original bitrate (0-100, default: 70)"
+    )
+
+    parser.add_argument(
+        "-m", "--move-files",
+        action="store_true",
+        help="Move original files to 'original_files' folder after conversion"
     )
 
     args = parser.parse_args()
@@ -621,7 +648,7 @@ Examples:
         print("Error: Compression factor must be between 0 and 100")
         sys.exit(1)
     config = Config(compression_factor=compression_factor)
-    processor = VideoProcessor(config, args.verbose)
+    processor = VideoProcessor(config, args.verbose, args.move_files)
 
     try:
         if args.working_dir:
