@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utils import Config, setup_logging, check_dependencies, VideoInfo
+from utils import Config, setup_logging, check_dependencies, VideoInfo, validate_workers, ValidationError, write_error_log
 
 
 class AudioExtractor:
@@ -188,12 +188,7 @@ class AudioExtractor:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-                log_path = self.logs_dir / f"{input_file.stem}_audio_timeout.log"
-                with open(log_path, 'w') as f:
-                    f.write(f"FFmpeg Command: {' '.join(cmd)}\n\n")
-                    f.write("Output:\n")
-                    for line in output_lines:
-                        f.write(line + '\n')
+                log_path = write_error_log(self.logs_dir, input_file.stem, "TIMEOUT", cmd, output_lines)
                 self.logger.error(f"Timeout extracting audio from {input_file}; log saved to {log_path}")
                 if inner_pbar:
                     inner_pbar.n = 0
@@ -203,12 +198,7 @@ class AudioExtractor:
                 return False
 
             if proc.returncode != 0:
-                log_path = self.logs_dir / f"{input_file.stem}_audio_error.log"
-                with open(log_path, 'w') as f:
-                    f.write(f"FFmpeg Command: {' '.join(cmd)}\n\n")
-                    f.write("Output:\n")
-                    for line in output_lines:
-                        f.write(line + '\n')
+                log_path = write_error_log(self.logs_dir, input_file.stem, "ERROR", cmd, output_lines)
                 self.logger.error(f"FFmpeg failed for {input_file}; log saved to {log_path}")
                 if inner_pbar:
                     inner_pbar.n = 0
@@ -390,11 +380,29 @@ Examples:
 
     args = parser.parse_args()
 
+    # Setup logging
+    logger = setup_logging(tool_name="extractAudio", verbose=args.verbose)
+
     if not check_dependencies():
-        print("Error: FFmpeg is required but not found in PATH")
+        logger.error("FFmpeg is required but not found in PATH")
+        sys.exit(1)
+
+    # Validate inputs
+    try:
+        max_workers = validate_workers(args.max_workers)
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
         sys.exit(1)
 
     config = Config()
+
+    # Validate config before processing
+    try:
+        config.validate()
+    except ValidationError as e:
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
+
     processor = VideoProcessor(config, args.output_format, args.verbose, args.move_files)
 
     try:
