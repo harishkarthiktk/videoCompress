@@ -10,24 +10,27 @@ import subprocess
 import platform
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple, Any, Callable
+from typing import List, Optional, Tuple, Any, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import logging
+from contextlib import contextmanager
 
-# Constants
-GPU_DETECT_TIMEOUT = 10
-FFPROBE_TIMEOUT = 30
-FFMPEG_TIMEOUT = 3600
+# Import constants
+from constants import (
+    BITRATE_THRESHOLDS, RESOLUTION_THRESHOLDS, TIMEOUTS,
+    SUPPORTED_VIDEO_FORMATS, INEFFICIENT_CODECS, LONG_DURATION_THRESHOLD
+)
+
+# Backward compatibility aliases
+GPU_DETECT_TIMEOUT = TIMEOUTS['GPU_DETECTION']
+FFPROBE_TIMEOUT = TIMEOUTS['FFPROBE']
+FFMPEG_TIMEOUT = TIMEOUTS['FFMPEG_CONVERSION']
 
 @dataclass
 class Config:
     """Configuration settings for video compression"""
-    SUPPORTED_FORMATS: Tuple[str, ...] = (
-        ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v",
-        ".mpg", ".3gp", ".MP4", ".MKV", ".AVI", ".MOV", ".FLV", ".WMV",
-        ".WEBM", ".M4V", ".MPG", ".3GP"
-    )
+    SUPPORTED_FORMATS: Tuple[str, ...] = SUPPORTED_VIDEO_FORMATS
     MAX_BITRATE: int = 10000  # Max total bitrate in kbps (10 Mbps)
     compression_factor: float = 0.7  # Compression factor (0.0-1.0)
     MAX_DOWNSCALE_PERCENT: float = 0.5  # Max resolution reduction
@@ -35,15 +38,79 @@ class Config:
     MIN_AUDIO_BITRATE: int = 64  # Minimum audio bitrate in kbps
     use_adaptive: bool = True  # Use adaptive compression factors based on metadata
 
-def setup_logging(verbose: bool = False) -> logging.Logger:
-    """Setup logging configuration"""
+    def validate(self) -> None:
+        """
+        Validate all configuration values.
+
+        Raises:
+            ValidationError: If any config value is invalid
+        """
+        if not (0 <= self.compression_factor <= 1):
+            raise ValidationError(
+                f"compression_factor must be 0-1, got {self.compression_factor}"
+            )
+        if self.MAX_BITRATE < self.MIN_AUDIO_BITRATE:
+            raise ValidationError(
+                f"MAX_BITRATE ({self.MAX_BITRATE}) < "
+                f"MIN_AUDIO_BITRATE ({self.MIN_AUDIO_BITRATE})"
+            )
+        if self.MIN_AUDIO_BITRATE <= 0:
+            raise ValidationError(
+                f"MIN_AUDIO_BITRATE must be positive, got {self.MIN_AUDIO_BITRATE}"
+            )
+        if self.MAX_BITRATE <= 0:
+            raise ValidationError(
+                f"MAX_BITRATE must be positive, got {self.MAX_BITRATE}"
+            )
+        if not (0 < self.MAX_DOWNSCALE_PERCENT <= 1):
+            raise ValidationError(
+                f"MAX_DOWNSCALE_PERCENT must be 0-1, got {self.MAX_DOWNSCALE_PERCENT}"
+            )
+        if not self.SUPPORTED_FORMATS:
+            raise ValidationError("SUPPORTED_FORMATS cannot be empty")
+
+def setup_logging(tool_name: str = "videoCompress", verbose: bool = False) -> logging.Logger:
+    """
+    Configure logging for all tools consistently.
+
+    Args:
+        tool_name: Name of tool (e.g., 'compressVid', 'extractAudio')
+        verbose: Enable debug-level logging
+
+    Returns:
+        Configured logger instance
+    """
+    import sys
+
+    logger = logging.getLogger(tool_name)
+
+    # Clear existing handlers to avoid duplicates
+    logger.handlers.clear()
+
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+    logger.setLevel(level)
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    formatter = logging.Formatter(
+        fmt='[%(asctime)s] [%(name)s] %(levelname)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    return logging.getLogger(__name__)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler - logs to file in logs/ directory
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    log_file = logs_dir / f"{tool_name}.log"
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
 
 def check_dependencies() -> bool:
     """Check if required dependencies are available"""
@@ -54,50 +121,370 @@ def check_dependencies() -> bool:
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
+
+class ValidationError(ValueError):
+    """Custom exception for validation failures"""
+    pass
+
+
+def validate_compression_factor(value: float) -> float:
+    """
+    Ensure compression_factor is valid (0-1 range).
+
+    Args:
+        value: Compression factor to validate
+
+    Returns:
+        Validated compression factor
+
+    Raises:
+        ValidationError: If value is outside valid range
+    """
+    try:
+        cf = float(value)
+        if not (0 <= cf <= 1):
+            raise ValidationError(
+                f"Compression factor must be 0-1, got {cf}"
+            )
+        return cf
+    except (TypeError, ValueError) as e:
+        raise ValidationError(
+            f"Compression factor must be numeric, got {value}"
+        ) from e
+
+
+def validate_workers(value: int) -> int:
+    """
+    Ensure worker count is valid (1-10 range).
+
+    Args:
+        value: Number of workers to validate
+
+    Returns:
+        Validated worker count
+
+    Raises:
+        ValidationError: If value is outside valid range
+    """
+    try:
+        workers = int(value)
+        if not (1 <= workers <= 10):
+            raise ValidationError(
+                f"Workers must be 1-10, got {workers}"
+            )
+        return workers
+    except (TypeError, ValueError) as e:
+        raise ValidationError(
+            f"Workers must be integer, got {value}"
+        ) from e
+
+
+def validate_video_metadata(width, height, video_bitrate, audio_bitrate) -> bool:
+    """
+    Validate that video metadata is reasonable.
+
+    Args:
+        width: Video width in pixels
+        height: Video height in pixels
+        video_bitrate: Video bitrate in kbps
+        audio_bitrate: Audio bitrate in kbps
+
+    Returns:
+        True if all metadata is valid
+
+    Raises:
+        ValidationError: If metadata is invalid
+    """
+    if width is None or height is None:
+        raise ValidationError("Video must have width and height")
+    if width <= 0 or height <= 0:
+        raise ValidationError(
+            f"Invalid resolution: {width}x{height}"
+        )
+    if video_bitrate is not None and video_bitrate < 0:
+        raise ValidationError(
+            f"Invalid video bitrate: {video_bitrate} kbps"
+        )
+    if audio_bitrate is not None and audio_bitrate < 0:
+        raise ValidationError(
+            f"Invalid audio bitrate: {audio_bitrate} kbps"
+        )
+    return True
+
+
+def write_error_log(
+    log_dir: Path,
+    file_stem: str,
+    error_type: str,
+    cmd: List[str],
+    output_lines: List[str]
+) -> Path:
+    """
+    Write standardized error log file.
+
+    Args:
+        log_dir: Directory to save log (created if missing)
+        file_stem: Filename stem (e.g., 'video_name')
+        error_type: Type of error (e.g., 'TIMEOUT', 'ERROR')
+        cmd: Command that failed (list)
+        output_lines: Output/error lines from command
+
+    Returns:
+        Path to written log file
+    """
+    from datetime import datetime
+
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_dir / f'{file_stem}_{error_type}_{timestamp}.log'
+
+    with open(log_file, 'w', encoding='utf-8', errors='replace') as f:
+        f.write(f"Error Type: {error_type}\n")
+        f.write(f"Command: {' '.join(cmd)}\n")
+        f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+        f.write("=" * 80 + "\n")
+        for line in output_lines:
+            f.write(line + '\n')
+
+    return log_file
+
+
+def find_media_files(
+    directory: Path,
+    supported_formats: Tuple[str, ...],
+    recursive: bool = False,
+    exclude_suffix: str = None
+) -> List[Path]:
+    """
+    Find media files matching criteria.
+
+    Args:
+        directory: Root directory to search
+        supported_formats: Tuple of extensions (e.g., ('.mp4', '.mkv'))
+        recursive: If True, search subdirectories
+        exclude_suffix: Skip files ending with this (e.g., '_conv')
+
+    Returns:
+        List of matching file paths sorted by name
+
+    Raises:
+        ValueError: If directory does not exist
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise ValueError(f"{directory} is not a directory")
+
+    files = []
+
+    if recursive:
+        for root, dirs, filenames in os.walk(directory):
+            for filename in filenames:
+                file_path = Path(root) / filename
+                if file_path.suffix in supported_formats:
+                    files.append(file_path)
+    else:
+        for file_path in directory.iterdir():
+            if file_path.is_file() and file_path.suffix in supported_formats:
+                files.append(file_path)
+
+    # Filter out files with exclude suffix if specified
+    if exclude_suffix:
+        files = [f for f in files if not f.stem.endswith(exclude_suffix)]
+
+    return sorted(files)
+
+
+@contextmanager
+def progress_bar_context(
+    total: int,
+    desc: str = None,
+    disable: bool = False
+) -> Generator:
+    """
+    Context manager for automatic progress bar cleanup.
+
+    Ensures progress bar is properly closed even if exception occurs.
+
+    Args:
+        total: Total number of items to process
+        desc: Description for the progress bar
+        disable: If True, disable progress bar
+
+    Yields:
+        tqdm progress bar object
+    """
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total, desc=desc, disable=disable)
+    except ImportError:
+        # Fallback if tqdm not available
+        class DummyProgressBar:
+            def __init__(self):
+                self.n = 0
+
+            def update(self, n=1):
+                self.n += n
+
+            def close(self):
+                pass
+
+        pbar = DummyProgressBar()
+
+    try:
+        yield pbar
+    finally:
+        if hasattr(pbar, 'close'):
+            try:
+                pbar.close()
+            except Exception:
+                pass  # Suppress errors during cleanup
+
+
+def safe_callback_wrapper(callback: Callable, timeout: float = None) -> Callable:
+    """
+    Wrap callback to prevent errors from crashing processing.
+
+    If callback fails, logs warning but continues processing.
+
+    Args:
+        callback: Callback function to wrap
+        timeout: Optional timeout in seconds (not enforced, for future use)
+
+    Returns:
+        Wrapped callback function that suppresses exceptions
+    """
+    def wrapper(*args, **kwargs):
+        try:
+            callback(*args, **kwargs)
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Progress callback failed (continuing): {e}")
+
+    return wrapper
+
+
+class OptionalDependency:
+    """
+    Gracefully handle optional dependencies.
+
+    Allows package to work even if optional packages are missing,
+    but warns user about unavailable features.
+    """
+
+    def __init__(self, import_name: str, package_name: str):
+        """
+        Initialize optional dependency handler.
+
+        Args:
+            import_name: Module name to import (e.g., 'PIL')
+            package_name: Package name for installation (e.g., 'Pillow')
+        """
+        self.import_name = import_name
+        self.package_name = package_name
+        self.available = False
+        self.module = None
+        self._try_import()
+
+    def _try_import(self):
+        """Attempt to import the optional dependency."""
+        try:
+            self.module = __import__(self.import_name)
+            self.available = True
+        except ImportError:
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"Optional dependency '{self.package_name}' not available. "
+                f"Install with: pip install {self.package_name}"
+            )
+
+    def __getattr__(self, name):
+        """Forward attribute access to the module if available."""
+        if not self.available:
+            raise ImportError(
+                f"Optional dependency '{self.package_name}' is not installed. "
+                f"Install with: pip install {self.package_name}"
+            )
+        return getattr(self.module, name)
+
+
+# Optional dependencies
+PIL = OptionalDependency('PIL', 'Pillow')
+TQDM = OptionalDependency('tqdm', 'tqdm')
+
 class GPUDetector:
     """Handles GPU detection across different platforms"""
+
+    @staticmethod
+    def _detect_windows() -> str:
+        """Windows GPU detection via WMI"""
+        try:
+            output = subprocess.check_output(
+                ['wmic', 'path', 'win32_VideoController', 'get', 'Name'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'nvidia' in output:
+                return 'NVIDIA'
+            elif 'intel' in output:
+                return 'INTEL'
+            elif 'amd' in output or 'radeon' in output:
+                return 'AMD'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"Windows GPU detection failed: {e}")
+        return 'CPU'
+
+    @staticmethod
+    def _detect_linux() -> str:
+        """Linux GPU detection via lspci"""
+        try:
+            output = subprocess.check_output(
+                ['lspci'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'nvidia' in output:
+                return 'NVIDIA'
+            elif 'intel' in output:
+                return 'INTEL'
+            elif 'amd' in output or 'radeon' in output:
+                return 'AMD'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"Linux GPU detection failed: {e}")
+        return 'CPU'
+
+    @staticmethod
+    def _detect_macos() -> str:
+        """macOS GPU detection via system_profiler"""
+        try:
+            output = subprocess.check_output(
+                ['system_profiler', 'SPDisplaysDataType'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'gpu' in output or 'apple' in output or 'm1' in output or 'm2' in output or 'm3' in output:
+                return 'APPLE'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"macOS GPU detection failed: {e}")
+        return 'CPU'
 
     @staticmethod
     def detect() -> str:
         """Detect available GPU type with priority: NVIDIA > Intel > AMD > Apple > CPU"""
         system = platform.system()
-        gpu_type = "CPU"
 
-        try:
-            if system == "Windows":
-                output = subprocess.check_output(
-                    "wmic path win32_VideoController get Name",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            elif system == "Linux":
-                output = subprocess.check_output(
-                    "lspci | grep -i vga",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            elif system == "Darwin":  # macOS
-                output = subprocess.check_output(
-                    "system_profiler SPDisplaysDataType",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            else:
-                return gpu_type
-
-            output = output.lower()
-
-            # Priority order detection
-            if "nvidia" in output:
-                gpu_type = "NVIDIA"
-            elif "intel" in output:
-                gpu_type = "INTEL"
-            elif "amd" in output or "radeon" in output:
-                gpu_type = "AMD"
-            elif "apple" in output or "m1" in output or "m2" in output or "m3" in output:
-                gpu_type = "APPLE"
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
-            logging.warning(f"GPU detection failed: {e}")
-
-        return gpu_type
+        if system == "Windows":
+            return GPUDetector._detect_windows()
+        elif system == "Linux":
+            return GPUDetector._detect_linux()
+        elif system == "Darwin":  # macOS
+            return GPUDetector._detect_macos()
+        else:
+            return "CPU"
 
 class VideoInfo:
     """Handles video information extraction"""
@@ -253,14 +640,12 @@ class VideoConverter:
             self.logger.info(f"Using static compression: factor={self.config.compression_factor}, downscale={self.config.MAX_DOWNSCALE_PERCENT}")
             return new_width, new_height, target_video_bitrate, target_audio_bitrate
 
-        # Adaptive logic
-        # Thresholds
-        HIGH_BITRATE_THRESHOLD = 8000  # kbps
-        LOW_BITRATE_THRESHOLD = 2000   # kbps
-        HD_HEIGHT = 1080
-        FOURK_HEIGHT = 2160
-        LONG_DURATION = 3600  # seconds
-        INEFFICIENT_CODECS = {'mpeg4', 'wmv2', 'msmpeg4'}
+        # Adaptive logic - use constants
+        HIGH_BITRATE_THRESHOLD = BITRATE_THRESHOLDS['HIGH']
+        LOW_BITRATE_THRESHOLD = BITRATE_THRESHOLDS['MEDIUM']
+        HD_HEIGHT = RESOLUTION_THRESHOLDS['HD']
+        FOURK_HEIGHT = RESOLUTION_THRESHOLDS['4K']
+        LONG_DURATION = LONG_DURATION_THRESHOLD
 
         # Base factors
         base_factor = self.config.compression_factor  # 0.7 default
@@ -598,31 +983,25 @@ class VideoProcessor:
 
     def find_video_files(self, directory: Path, recursive: bool = False) -> List[Path]:
         """Find all supported video files in directory, optionally recursive"""
-        video_files = []
-
-        if not directory.exists() or not directory.is_dir():
-            self.logger.error(f"Directory does not exist: {directory}")
+        try:
+            video_files = find_media_files(
+                directory,
+                supported_formats=self.config.SUPPORTED_FORMATS,
+                recursive=recursive,
+                exclude_suffix=None
+            )
+            log_msg = f"Found {len(video_files)} video files in {directory}"
+            if recursive:
+                log_msg += " (recursive)"
+            self.logger.info(log_msg)
             return video_files
 
-        try:
-            if recursive:
-                for root, dirs, files in os.walk(directory):
-                    for file in files:
-                        file_path = Path(root) / file
-                        if file_path.suffix in self.config.SUPPORTED_FORMATS:
-                            video_files.append(file_path)
-                self.logger.info(f"Found {len(video_files)} video files in {directory} (recursive)")
-            else:
-                for file_path in directory.iterdir():
-                    if file_path.is_file() and file_path.suffix in self.config.SUPPORTED_FORMATS:
-                        video_files.append(file_path)
-                self.logger.info(f"Found {len(video_files)} video files in {directory}")
-
-            return sorted(video_files)
-
+        except ValueError as e:
+            self.logger.error(f"Error: {e}")
+            return []
         except PermissionError:
             self.logger.error(f"Permission denied accessing directory: {directory}")
-            return video_files
+            return []
 
     def validate_files(self, file_paths: List[str]) -> List[Path]:
         """Validate and convert file paths to Path objects"""

@@ -42,6 +42,9 @@ from tqdm import tqdm
 import webrtcvad
 import whisper
 
+# Import from utils
+from utils import setup_logging
+
 # Global constants (reused/adapted from compressVid.py)
 FFPROBE_TIMEOUT = 30
 FFMPEG_TIMEOUT = 3600
@@ -720,6 +723,9 @@ Examples:
 
     args = parser.parse_args()
 
+    # Setup logging
+    logger = setup_logging(tool_name="isConversation", verbose=args.verbose)
+
     # Update config from args
     config = CONFIG.copy()
     config["analysis"]["whisper_model"] = args.model
@@ -734,14 +740,14 @@ Examples:
             thresholds = json.loads(args.thresholds)
             config["analysis"].update(thresholds)
         except json.JSONDecodeError as e:
-            print(f"Invalid thresholds JSON: {e}")
+            logger.error(f"Invalid thresholds JSON: {e}")
             sys.exit(1)
 
     # Check dependencies
     if not check_dependencies():
-        print("Error: FFmpeg and ffprobe are required but not found in PATH.")
-        print("Please install FFmpeg: https://ffmpeg.org/download.html")
-        print("\nFor Python libs: pip install openai-whisper webrtcvad tqdm soundfile numpy")
+        logger.error("FFmpeg and ffprobe are required but not found in PATH.")
+        logger.error("Please install FFmpeg: https://ffmpeg.org/download.html")
+        logger.error("For Python libs: pip install openai-whisper webrtcvad tqdm soundfile numpy")
         sys.exit(1)
 
     # Initialize analyzer

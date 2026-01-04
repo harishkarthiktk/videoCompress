@@ -22,7 +22,7 @@ from typing import List
 
 from tqdm import tqdm
 
-from utils import Config, setup_logging, check_dependencies, VideoProcessor
+from utils import Config, setup_logging, check_dependencies, VideoProcessor, validate_compression_factor, validate_workers, ValidationError
 
 def main():
     """Main entry point"""
@@ -80,18 +80,32 @@ Examples:
 
     args = parser.parse_args()
 
+    # Setup logging
+    logger = setup_logging(tool_name="compressVid", verbose=args.verbose)
+
     # Check dependencies
     if not check_dependencies():
-        print("Error: FFmpeg and FFprobe are required but not found in PATH")
-        print("Please install FFmpeg: https://ffmpeg.org/download.html")
+        logger.error("FFmpeg and FFprobe are required but not found in PATH")
+        logger.error("Please install FFmpeg: https://ffmpeg.org/download.html")
+        sys.exit(1)
+
+    # Validate inputs
+    try:
+        compression_factor = validate_compression_factor(args.compression_factor / 100.0)
+        max_workers = validate_workers(args.max_workers)
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
         sys.exit(1)
 
     # Initialize config
-    compression_factor = args.compression_factor / 100.0
-    if not 0 <= compression_factor <= 1:
-        print("Error: Compression factor must be between 0 and 100")
-        sys.exit(1)
     config = Config(compression_factor=compression_factor)
+
+    # Validate config before processing
+    try:
+        config.validate()
+    except ValidationError as e:
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
 
     # Initialize processor
     processor = VideoProcessor(config, args.verbose, args.move_files)
