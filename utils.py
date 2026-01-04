@@ -10,10 +10,11 @@ import subprocess
 import platform
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple, Any, Callable
+from typing import List, Optional, Tuple, Any, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import logging
+from contextlib import contextmanager
 
 # Import constants
 from constants import (
@@ -294,50 +295,196 @@ def find_media_files(
 
     return sorted(files)
 
+
+@contextmanager
+def progress_bar_context(
+    total: int,
+    desc: str = None,
+    disable: bool = False
+) -> Generator:
+    """
+    Context manager for automatic progress bar cleanup.
+
+    Ensures progress bar is properly closed even if exception occurs.
+
+    Args:
+        total: Total number of items to process
+        desc: Description for the progress bar
+        disable: If True, disable progress bar
+
+    Yields:
+        tqdm progress bar object
+    """
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total, desc=desc, disable=disable)
+    except ImportError:
+        # Fallback if tqdm not available
+        class DummyProgressBar:
+            def __init__(self):
+                self.n = 0
+
+            def update(self, n=1):
+                self.n += n
+
+            def close(self):
+                pass
+
+        pbar = DummyProgressBar()
+
+    try:
+        yield pbar
+    finally:
+        if hasattr(pbar, 'close'):
+            try:
+                pbar.close()
+            except Exception:
+                pass  # Suppress errors during cleanup
+
+
+def safe_callback_wrapper(callback: Callable, timeout: float = None) -> Callable:
+    """
+    Wrap callback to prevent errors from crashing processing.
+
+    If callback fails, logs warning but continues processing.
+
+    Args:
+        callback: Callback function to wrap
+        timeout: Optional timeout in seconds (not enforced, for future use)
+
+    Returns:
+        Wrapped callback function that suppresses exceptions
+    """
+    def wrapper(*args, **kwargs):
+        try:
+            callback(*args, **kwargs)
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Progress callback failed (continuing): {e}")
+
+    return wrapper
+
+
+class OptionalDependency:
+    """
+    Gracefully handle optional dependencies.
+
+    Allows package to work even if optional packages are missing,
+    but warns user about unavailable features.
+    """
+
+    def __init__(self, import_name: str, package_name: str):
+        """
+        Initialize optional dependency handler.
+
+        Args:
+            import_name: Module name to import (e.g., 'PIL')
+            package_name: Package name for installation (e.g., 'Pillow')
+        """
+        self.import_name = import_name
+        self.package_name = package_name
+        self.available = False
+        self.module = None
+        self._try_import()
+
+    def _try_import(self):
+        """Attempt to import the optional dependency."""
+        try:
+            self.module = __import__(self.import_name)
+            self.available = True
+        except ImportError:
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"Optional dependency '{self.package_name}' not available. "
+                f"Install with: pip install {self.package_name}"
+            )
+
+    def __getattr__(self, name):
+        """Forward attribute access to the module if available."""
+        if not self.available:
+            raise ImportError(
+                f"Optional dependency '{self.package_name}' is not installed. "
+                f"Install with: pip install {self.package_name}"
+            )
+        return getattr(self.module, name)
+
+
+# Optional dependencies
+PIL = OptionalDependency('PIL', 'Pillow')
+TQDM = OptionalDependency('tqdm', 'tqdm')
+
 class GPUDetector:
     """Handles GPU detection across different platforms"""
+
+    @staticmethod
+    def _detect_windows() -> str:
+        """Windows GPU detection via WMI"""
+        try:
+            output = subprocess.check_output(
+                ['wmic', 'path', 'win32_VideoController', 'get', 'Name'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'nvidia' in output:
+                return 'NVIDIA'
+            elif 'intel' in output:
+                return 'INTEL'
+            elif 'amd' in output or 'radeon' in output:
+                return 'AMD'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"Windows GPU detection failed: {e}")
+        return 'CPU'
+
+    @staticmethod
+    def _detect_linux() -> str:
+        """Linux GPU detection via lspci"""
+        try:
+            output = subprocess.check_output(
+                ['lspci'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'nvidia' in output:
+                return 'NVIDIA'
+            elif 'intel' in output:
+                return 'INTEL'
+            elif 'amd' in output or 'radeon' in output:
+                return 'AMD'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"Linux GPU detection failed: {e}")
+        return 'CPU'
+
+    @staticmethod
+    def _detect_macos() -> str:
+        """macOS GPU detection via system_profiler"""
+        try:
+            output = subprocess.check_output(
+                ['system_profiler', 'SPDisplaysDataType'],
+                timeout=GPU_DETECT_TIMEOUT,
+                text=True
+            )
+            output = output.lower()
+            if 'gpu' in output or 'apple' in output or 'm1' in output or 'm2' in output or 'm3' in output:
+                return 'APPLE'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logging.debug(f"macOS GPU detection failed: {e}")
+        return 'CPU'
 
     @staticmethod
     def detect() -> str:
         """Detect available GPU type with priority: NVIDIA > Intel > AMD > Apple > CPU"""
         system = platform.system()
-        gpu_type = "CPU"
 
-        try:
-            if system == "Windows":
-                output = subprocess.check_output(
-                    "wmic path win32_VideoController get Name",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            elif system == "Linux":
-                output = subprocess.check_output(
-                    "lspci | grep -i vga",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            elif system == "Darwin":  # macOS
-                output = subprocess.check_output(
-                    "system_profiler SPDisplaysDataType",
-                    shell=True, text=True, timeout=GPU_DETECT_TIMEOUT
-                )
-            else:
-                return gpu_type
-
-            output = output.lower()
-
-            # Priority order detection
-            if "nvidia" in output:
-                gpu_type = "NVIDIA"
-            elif "intel" in output:
-                gpu_type = "INTEL"
-            elif "amd" in output or "radeon" in output:
-                gpu_type = "AMD"
-            elif "apple" in output or "m1" in output or "m2" in output or "m3" in output:
-                gpu_type = "APPLE"
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
-            logging.warning(f"GPU detection failed: {e}")
-
-        return gpu_type
+        if system == "Windows":
+            return GPUDetector._detect_windows()
+        elif system == "Linux":
+            return GPUDetector._detect_linux()
+        elif system == "Darwin":  # macOS
+            return GPUDetector._detect_macos()
+        else:
+            return "CPU"
 
 class VideoInfo:
     """Handles video information extraction"""
