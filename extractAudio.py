@@ -239,7 +239,7 @@ class VideoProcessor:
 
     def __init__(self, config: Config, output_format: str, verbose: bool = False, move_files: bool = False):
         self.config = config
-        self.logger = setup_logging(verbose)
+        self.logger = setup_logging(tool_name="extractAudio", verbose=verbose)
         self.logs_dir = Path("logs")
         self.logs_dir.mkdir(exist_ok=True)
         self.extractor = AudioExtractor(config, output_format, move_files, self.logs_dir)

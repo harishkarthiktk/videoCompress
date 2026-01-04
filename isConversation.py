@@ -266,7 +266,7 @@ class ConversationAnalyzer:
 
     def __init__(self, config: Dict[str, Any], verbose: bool = False):
         self.config = config
-        self.logger = setup_logging(verbose)
+        self.logger = setup_logging(tool_name="isConversation", verbose=verbose)
         self.logs_dir = Path("analysis_logs")
         self.logs_dir.mkdir(exist_ok=True)
         self.stats = {
@@ -414,7 +414,7 @@ class ConversationAnalyzer:
         """Analyze a single video file."""
         try:
             # Check audio presence
-            has_audio, duration = VideoInfo.get_info(file_path)
+            _, _, _, has_audio, _, duration, _, _, _, _, _ = VideoInfo.get_info(file_path)
             if not has_audio:
                 self.logger.info(f"No audio in {file_path}")
                 self.stats["no_audio"] += 1
@@ -537,7 +537,7 @@ class ConversationAnalyzer:
             if precheck_pbar:
                 precheck_pbar.update(1)
 
-            has_audio, duration = VideoInfo.get_info(file_path)
+            _, _, _, has_audio, _, duration, _, _, _, _, _ = VideoInfo.get_info(file_path)
             if not has_audio:
                 self.logger.info(f"No audio in {file_path}")
                 self.stats["no_audio"] += 1

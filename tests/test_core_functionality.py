@@ -48,9 +48,9 @@ class TestCriticalFunctionality:
         with patch('subprocess.run', side_effect=Exception("ffprobe not found")):
             info = VideoInfo.get_info(Path("test_video.mp4"))
 
-            # Should return tuple with 10 elements (not crash)
+            # Should return tuple with 11 elements (not crash)
             assert isinstance(info, tuple)
-            assert len(info) == 10
+            assert len(info) == 11
             # Should have None values for missing metadata
             assert info[0] is None  # width
             assert info[1] is None  # height

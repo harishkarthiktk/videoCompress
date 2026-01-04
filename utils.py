@@ -491,14 +491,14 @@ class VideoInfo:
     """Handles video information extraction"""
 
     @staticmethod
-    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], int, int, Optional[float], Optional[str]]:
+    def get_info(file_path: Path) -> Tuple[Optional[int], Optional[int], Optional[int], bool, Optional[int], Optional[float], int, int, Optional[float], Optional[str], Optional[int]]:
         """
         Extract video resolution, bitrates, audio presence, duration, nb_frames, rotation, fps, codec using ffprobe.
         Supports adaptive compression by including codec for inefficiency detection.
 
         Returns:
-            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees, fps, codec_name)
-            or (None, None, None, False, None, None, -1, 0, None, None) on error
+            Tuple of (width, height, video_bitrate_kbps, has_audio, audio_bitrate_kbps, duration_seconds, nb_frames, rotation_degrees, fps, codec_name, file_size_bytes)
+            or (None, None, None, False, None, None, -1, 0, None, None, None) on error
         """
         try:
             cmd = [
@@ -521,7 +521,7 @@ class VideoInfo:
 
             if not video_stream:
                 logging.error(f"No video stream found in {file_path}")
-                return None, None, None, False, None, None, -1, 0, None, None
+                return None, None, None, False, None, None, -1, 0, None, None, None
 
             width_str = video_stream.get('width')
             width = int(width_str) if width_str is not None else None
@@ -580,12 +580,21 @@ class VideoInfo:
             # Extract codec name
             codec = video_stream.get('codec_name')
 
-            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec
+            # Extract file size from format (for bitrate estimation when stream bitrate unavailable)
+            file_size_str = format_info.get('size')
+            file_size = None
+            if file_size_str is not None:
+                try:
+                    file_size = int(file_size_str)
+                except (ValueError, TypeError):
+                    file_size = None
+
+            return width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec, file_size
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 json.JSONDecodeError, Exception) as e:
             logging.error(f"Failed to get video info for {file_path}: {e}")
-            return None, None, None, False, None, None, -1, 0, None, None
+            return None, None, None, False, None, None, -1, 0, None, None, None
 
 class VideoConverter:
     """Handles video conversion with GPU acceleration"""
@@ -598,19 +607,79 @@ class VideoConverter:
         self.per_file_callback = per_file_callback
         self.logger = logging.getLogger(__name__)
 
-    def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int], duration: Optional[float] = None, codec: Optional[str] = None) -> Tuple[int, int, int, int]:
+    def _calculate_target_params(self, width: int, height: int, video_bitrate: Optional[int], audio_bitrate: Optional[int], duration: Optional[float] = None, codec: Optional[str] = None, file_size: Optional[int] = None) -> Tuple[int, int, int, int]:
         """
         Calculate target resolution and bitrates with adaptive logic if enabled.
         Adaptive mode adjusts factors based on bitrate, resolution, duration, and codec for better efficiency.
         Falls back to static compression_factor if use_adaptive=False in Config.
+
+        If video_bitrate is unavailable, attempts to estimate from file_size and duration,
+        or falls back to resolution-based defaults.
         """
+        # Estimate video bitrate if unavailable
+        if video_bitrate is None or video_bitrate <= 0:
+            estimated_bitrate = None
+
+            # Debug: log why we're estimating
+            self.logger.debug(
+                f"Bitrate estimation needed - video_bitrate={video_bitrate}, "
+                f"file_size={file_size}, duration={duration}, audio_bitrate={audio_bitrate}"
+            )
+
+            # Try to estimate from file size and duration
+            if file_size is not None and file_size > 0 and duration is not None and duration > 0:
+                # Total bitrate = (file_size_bytes * 8) / duration_seconds / 1000 (kbps)
+                # Note: This includes container overhead (typically 2-5% for WebM/MP4)
+                total_bitrate = int((file_size * 8) / duration / 1000)
+
+                # Account for container overhead (subtract ~3% to be conservative)
+                # Container includes: headers, metadata, atoms, seek tables, etc.
+                CONTAINER_OVERHEAD_PERCENT = 0.03  # 3%
+                total_bitrate_adjusted = int(total_bitrate * (1 - CONTAINER_OVERHEAD_PERCENT))
+
+                # Estimate video bitrate by subtracting audio bitrate from adjusted total
+                # Assume audio is ~10-15% of total for typical videos, or use known audio_bitrate
+                if audio_bitrate is not None and audio_bitrate > 0:
+                    estimated_bitrate = max(total_bitrate_adjusted - audio_bitrate, 500)
+                else:
+                    # Conservative estimate: assume 128 kbps audio
+                    estimated_bitrate = max(total_bitrate_adjusted - 128, 500)
+
+                self.logger.debug(
+                    f"Successfully estimated bitrate from file_size/duration (adjusted for {CONTAINER_OVERHEAD_PERCENT*100:.0f}% container overhead)"
+                )
+                self.logger.info(
+                    f"Estimated video bitrate from file size: {estimated_bitrate}kbps "
+                    f"(file: {file_size / (1024*1024):.1f}MB, duration: {duration:.1f}s, total: {total_bitrate}kbps → {total_bitrate_adjusted}kbps after {CONTAINER_OVERHEAD_PERCENT*100:.0f}% overhead)"
+                )
+                video_bitrate = estimated_bitrate
+
+            # Fall back to resolution-based defaults if estimation not possible
+            if video_bitrate is None or video_bitrate <= 0:
+                self.logger.debug(
+                    f"Cannot estimate from file_size/duration; falling back to resolution-based defaults. "
+                    f"(file_size={file_size}, duration={duration})"
+                )
+                # Use conservative resolution-based defaults
+                if height >= RESOLUTION_THRESHOLDS['4K']:
+                    estimated_bitrate = 8000  # 4K: 8 Mbps
+                elif height >= RESOLUTION_THRESHOLDS['HD']:
+                    estimated_bitrate = 3000  # 1080p: 3 Mbps
+                elif height >= RESOLUTION_THRESHOLDS['SD']:
+                    estimated_bitrate = 1500  # 720p: 1.5 Mbps
+                else:
+                    estimated_bitrate = 1000  # SD: 1 Mbps
+
+                self.logger.warning(
+                    f"Could not detect or estimate bitrate; using resolution-based default: "
+                    f"{estimated_bitrate}kbps for {height}p video"
+                )
+                video_bitrate = estimated_bitrate
+
         if not self.config.use_adaptive:
             # Fallback to static calculation for backward compatibility
-            # Handle missing bitrates
-            if video_bitrate is None or video_bitrate <= 0:
-                target_video_bitrate = self.config.MAX_BITRATE
-            else:
-                target_video_bitrate = int(video_bitrate * self.config.compression_factor)
+            # video_bitrate should now always be set from estimation above
+            target_video_bitrate = int(video_bitrate * self.config.compression_factor)
 
             if audio_bitrate is None or audio_bitrate <= 0:
                 target_audio_bitrate = 128
@@ -688,10 +757,8 @@ class VideoConverter:
             audio_factor = 0.8  # Fixed for low/no audio
 
         # Calculate targets
-        if video_bitrate is None or video_bitrate <= 0:
-            target_video_bitrate = self.config.MAX_BITRATE
-        else:
-            target_video_bitrate = int(video_bitrate * video_factor)
+        # video_bitrate should now always be set from estimation above
+        target_video_bitrate = int(video_bitrate * video_factor)
 
         if audio_bitrate is None or audio_bitrate <= 0:
             target_audio_bitrate = 128
@@ -796,7 +863,7 @@ class VideoConverter:
 
             # Get video info (unified return)
             info = VideoInfo.get_info(input_file)
-            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec = info
+            width, height, video_bitrate, has_audio, audio_bitrate, duration, nb_frames, rotation, fps, codec, file_size = info
             if width is None or height is None:
                 self.logger.error(f"Could not determine video dimensions for {input_file}")
                 if pbar:
@@ -826,7 +893,7 @@ class VideoConverter:
 
             # Calculate target parameters
             new_width, new_height, target_video_bitrate, target_audio_bitrate = self._calculate_target_params(
-                width, height, video_bitrate, audio_bitrate, duration=duration, codec=codec
+                width, height, video_bitrate, audio_bitrate, duration=duration, codec=codec, file_size=file_size
             )
 
             # Handle dry-run mode
