@@ -1,0 +1,5 @@
+numpy==2.4.0
+Pillow==12.1.0
+pytest==9.0.2
+webrtcvad==2.0.10
+whisper==1.1.10

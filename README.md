@@ -12,8 +12,21 @@ This repository contains three Python scripts for handling common video-processi
 
 * Python 3.7+
 * [FFmpeg](https://ffmpeg.org/download.html) (must be installed and available in your system PATH)
-* tqdm (for progress bars in CLI)
-* For the GUI: tkinter (included in standard Python installation), optional Pillow (PIL) for window icon
+
+**Installation:**
+```bash
+pip install -r requirements.txt
+```
+
+**For development and testing:**
+```bash
+pip install -r requirements-dev.txt
+```
+
+**Optional features:**
+* For the GUI: tkinter (included in standard Python installation), Pillow (PIL) for window icon
+* For conversation detection: numpy, webrtcvad, whisper (included in requirements-dev.txt)
+* For testing: pytest (included in requirements-dev.txt)
 
 ---
 
