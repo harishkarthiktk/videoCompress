@@ -37,6 +37,7 @@ class Config:
     OUTPUT_SUFFIX: str = "_conv"
     MIN_AUDIO_BITRATE: int = 64  # Minimum audio bitrate in kbps
     use_adaptive: bool = True  # Use adaptive compression factors based on metadata
+    dry_run: bool = False  # If True, only analyze, don't compress
 
     def validate(self) -> None:
         """
@@ -828,6 +829,38 @@ class VideoConverter:
                 width, height, video_bitrate, audio_bitrate, duration=duration, codec=codec
             )
 
+            # Handle dry-run mode
+            if self.config.dry_run:
+                # Estimate output size
+                if video_bitrate and duration:
+                    estimated_video_bytes = (target_video_bitrate * 1000 * duration) // 8
+                    estimated_audio_bytes = (target_audio_bitrate * 1000 * duration) // 8 if audio_bitrate else 0
+                    estimated_total = estimated_video_bytes + estimated_audio_bytes
+
+                    # Estimate encoding time (rough: 300 fps with GPU, 100 fps with CPU)
+                    fps_processing = 300 if self.gpu_type != 'CPU' else 100
+                    estimated_time = duration / fps_processing
+
+                    input_size = input_file.stat().st_size
+                    compression_ratio = estimated_total / input_size if input_size > 0 else 0
+
+                    self.logger.info(f"DRY RUN: {input_file.name}")
+                    self.logger.info(f"  Original: {input_size / 1e9:.2f} GB ({video_bitrate} kbps video, {audio_bitrate or 0} kbps audio)")
+                    self.logger.info(f"  Estimated: {estimated_total / 1e9:.2f} GB ({target_video_bitrate} kbps video, {target_audio_bitrate} kbps audio)")
+                    self.logger.info(f"  Compression ratio: {compression_ratio*100:.1f}%")
+                    self.logger.info(f"  Est. encoding time: {estimated_time:.1f}s with {self.gpu_type}")
+                    self.logger.info(f"  Resolution: {width}x{height} -> {new_width}x{new_height}")
+                else:
+                    self.logger.info(f"DRY RUN: {input_file.name} - Cannot estimate (missing bitrate or duration)")
+
+                if pbar:
+                    if hasattr(pbar, 'total') and pbar.total is not None:
+                        pbar.n = pbar.total
+                    pbar.close()
+                if self.per_file_callback:
+                    self.per_file_callback(100.0)
+                return True
+
             self.logger.info(
                 f"Converting {input_file.name} -> {output_file.name} "
                 f"({width}x{height} -> {new_width}x{new_height}, "
@@ -971,9 +1004,10 @@ class VideoConverter:
 class VideoProcessor:
     """Main video processing orchestrator"""
 
-    def __init__(self, config: Config, verbose: bool = False, move_files: bool = False, per_file_callback: Optional[Callable[[float], None]] = None, logs_dir: Optional[Path] = None):
+    def __init__(self, config: Config, verbose: bool = False, move_files: bool = False, per_file_callback: Optional[Callable[[float], None]] = None, logs_dir: Optional[Path] = None, queue: Optional[Any] = None):
         self.config = config
         self.move_files = move_files
+        self.queue = queue
         self.logger = setup_logging(verbose)
         self.logs_dir = logs_dir or Path("logs")
         self.logs_dir.mkdir(exist_ok=True)
@@ -1043,6 +1077,19 @@ class VideoProcessor:
             self.logger.warning("No files to process")
             return 0, 0
 
+        # If queue exists, filter out already completed files
+        if self.queue:
+            completed_paths = [
+                f.input_path for f in self.queue.input_files
+                if f.status == 'completed'
+            ]
+            files = [f for f in files if str(f) not in completed_paths]
+            if files:
+                self.logger.info(f"Resuming queue: {self.queue.get_summary()}")
+            else:
+                self.logger.info(f"Queue already complete: {self.queue.get_summary()}")
+                return self.queue.completed, self.queue.failed
+
         successful = 0
         failed = 0
 
@@ -1074,8 +1121,20 @@ class VideoProcessor:
 
                 if success:
                     successful += 1
+                    # Update queue if present
+                    if self.queue:
+                        self.queue.mark_completed(file_path)
                 else:
                     failed += 1
+                    # Update queue if present
+                    if self.queue:
+                        self.queue.mark_failed(file_path, "Conversion failed")
+
+                # Save queue after each file
+                if self.queue:
+                    from queue import QueueManager
+                    queue_mgr = QueueManager()
+                    queue_mgr.save_queue(self.queue)
 
                 completed = successful + failed
                 if outer_pbar:
@@ -1099,11 +1158,24 @@ class VideoProcessor:
                 }
 
                 for future in as_completed(future_to_file):
+                    file_path = future_to_file[future]
                     success = future.result()
                     if success:
                         successful += 1
+                        # Update queue if present
+                        if self.queue:
+                            self.queue.mark_completed(file_path)
                     else:
                         failed += 1
+                        # Update queue if present
+                        if self.queue:
+                            self.queue.mark_failed(file_path, "Conversion failed")
+
+                    # Save queue after each file
+                    if self.queue:
+                        from queue import QueueManager
+                        queue_mgr = QueueManager()
+                        queue_mgr.save_queue(self.queue)
 
                     completed = successful + failed
                     if outer_pbar:
